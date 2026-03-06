@@ -107,35 +107,33 @@ describe('pipeline end-to-end', () => {
     const result = await runPipelineFromRepo(MINI_REPO, () => {});
 
     expect(result.processResult).toBeDefined();
+    expect(result.processResult.stats.totalProcesses).toBeGreaterThan(0);
 
-    // With a 4-function call chain (handler -> validator -> db -> formatter),
-    // there should be at least one process detected
-    if (result.processResult.stats.totalProcesses > 0) {
-      const process = result.processResult.processes[0];
+    const process = result.processResult.processes.find(p => p.entryPointId.includes('handleRequest'));
+    expect(process).toBeDefined();
 
-      // Each process should have valid structure
-      expect(process.id).toBeTruthy();
-      expect(process.stepCount).toBeGreaterThanOrEqual(3); // minSteps default
-      expect(process.trace.length).toBe(process.stepCount);
-      expect(process.entryPointId).toBeTruthy();
-      expect(process.terminalId).toBeTruthy();
-      expect(process.processType).toMatch(/^(intra_community|cross_community)$/);
+    // Each process should have valid structure
+    expect(process!.id).toBeTruthy();
+    expect(process!.stepCount).toBeGreaterThanOrEqual(3); // minSteps default
+    expect(process!.trace.length).toBe(process!.stepCount);
+    expect(process!.entryPointId).toBeTruthy();
+    expect(process!.terminalId).toBeTruthy();
+    expect(process!.processType).toMatch(/^(intra_community|cross_community)$/);
 
-      // Process nodes should be in the graph
-      const processNode = result.graph.getNode(process.id);
-      expect(processNode).toBeDefined();
-      expect(processNode!.label).toBe('Process');
+    // Process nodes should be in the graph
+    const processNode = result.graph.getNode(process!.id);
+    expect(processNode).toBeDefined();
+    expect(processNode!.label).toBe('Process');
 
-      // STEP_IN_PROCESS relationships should exist
-      let stepCount = 0;
-      for (const rel of result.graph.iterRelationships()) {
-        if (rel.type === 'STEP_IN_PROCESS' && rel.targetId === process.id) {
-          stepCount++;
-          expect(rel.step).toBeGreaterThanOrEqual(1);
-        }
+    // STEP_IN_PROCESS relationships should exist
+    let stepCount = 0;
+    for (const rel of result.graph.iterRelationships()) {
+      if (rel.type === 'STEP_IN_PROCESS' && rel.targetId === process!.id) {
+        stepCount++;
+        expect(rel.step).toBeGreaterThanOrEqual(1);
       }
-      expect(stepCount).toBe(process.stepCount);
     }
+    expect(stepCount).toBe(process!.stepCount);
   });
 
   it('reports progress through all 6 phases', async () => {

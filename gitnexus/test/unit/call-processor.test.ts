@@ -132,6 +132,24 @@ describe('processCallsFromExtracted', () => {
     expect(graph.relationships.filter(r => r.type === 'CALLS')).toHaveLength(2);
   });
 
+  it('normalizes worker source ids to exact symbol ids when line suffix is missing', async () => {
+    symbolTable.add('src/index.ts', 'main', 'Function:src/index.ts:main:3', 'Function');
+    symbolTable.add('src/index.ts', 'helper', 'Function:src/index.ts:helper:9', 'Function');
+
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/index.ts',
+      calledName: 'helper',
+      sourceId: 'Function:src/index.ts:main',
+    }];
+
+    await processCallsFromExtracted(graph, calls, symbolTable, importMap);
+
+    const rels = graph.relationships.filter(r => r.type === 'CALLS');
+    expect(rels).toHaveLength(1);
+    expect(rels[0].sourceId).toBe('Function:src/index.ts:main:3');
+    expect(rels[0].targetId).toBe('Function:src/index.ts:helper:9');
+  });
+
   it('calls progress callback', async () => {
     symbolTable.add('src/index.ts', 'foo', 'Function:src/index.ts:foo', 'Function');
 

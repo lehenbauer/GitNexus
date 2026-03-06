@@ -4,10 +4,11 @@ export interface ValidationResult {
 }
 
 export function validateInput(input: string): ValidationResult {
-  if (!input || input.trim().length === 0) {
+  const cleaned = sanitize(input);
+  if (!cleaned || cleaned.trim().length === 0) {
     return { valid: false, value: '' };
   }
-  return { valid: true, value: input.trim() };
+  return { valid: true, value: cleaned.trim() };
 }
 
 export function sanitize(input: string): string {
