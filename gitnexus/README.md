@@ -22,7 +22,7 @@ AI coding tools don't understand your codebase structure. They edit a function w
 npx gitnexus analyze
 ```
 
-That's it. This indexes the codebase, installs agent skills, registers Claude Code hooks, and creates `AGENTS.md` / `CLAUDE.md` context files — all in one command.
+That's it. This indexes the codebase, installs agent skills, registers Claude Code hooks, and creates `.gitnexus/context.md` — all in one command. (To write to `AGENTS.md` and `CLAUDE.md`, use `npx gitnexus sync-docs`).
 
 To configure MCP for your editor, run `npx gitnexus setup` once — or set it up manually below.
 

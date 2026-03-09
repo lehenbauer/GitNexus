@@ -51,6 +51,11 @@ program
   .action(createLazyAction(() => import('./status.js'), 'statusCommand'));
 
 program
+  .command('sync-docs')
+  .description('Materialize GitNexus metadata into repo files like AGENTS.md and CLAUDE.md')
+  .action(createLazyAction(() => import('./sync-docs.js'), 'syncDocsCommand'));
+
+program
   .command('clean')
   .description('Delete GitNexus index for current repo')
   .option('-f, --force', 'Skip confirmation prompt')

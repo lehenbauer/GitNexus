@@ -346,6 +346,7 @@ export const analyzeCommand = async (
 
   if (aiContext.files.length > 0) {
     console.log(`  Context: ${aiContext.files.join(', ')}`);
+    console.log(`  Note: Run \`gitnexus sync-docs\` to materialize metadata into repo documentation.`);
   }
 
   // Show a quiet summary if some edge types needed fallback insertion

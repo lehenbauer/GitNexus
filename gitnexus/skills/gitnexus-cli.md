@@ -15,7 +15,7 @@ All commands work via `npx` — no global install required.
 npx gitnexus analyze
 ```
 
-Run from the project root. This parses all source files, builds the knowledge graph, writes it to `.gitnexus/`, and generates CLAUDE.md / AGENTS.md context files.
+Run from the project root. This parses all source files, builds the knowledge graph, writes it to `.gitnexus/`, and generates `.gitnexus/context.md`. (Use `gitnexus sync-docs` to materialize to `AGENTS.md` / `CLAUDE.md`).
 
 | Flag           | Effect                                                           |
 | -------------- | ---------------------------------------------------------------- |

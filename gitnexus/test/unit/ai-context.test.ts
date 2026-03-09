@@ -32,12 +32,12 @@ describe('generateAIContextFiles', () => {
     expect(result.files.length).toBeGreaterThan(0);
   });
 
-  it('creates or updates CLAUDE.md with GitNexus section', async () => {
+  it('creates or updates context.md with GitNexus section by default', async () => {
     const stats = { nodes: 50, edges: 100, processes: 5 };
     await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats);
 
-    const claudeMdPath = path.join(tmpDir, 'CLAUDE.md');
-    const content = await fs.readFile(claudeMdPath, 'utf-8');
+    const contextMdPath = path.join(storagePath, 'context.md');
+    const content = await fs.readFile(contextMdPath, 'utf-8');
     expect(content).toContain('gitnexus:start');
     expect(content).toContain('gitnexus:end');
     expect(content).toContain('TestProject');
@@ -49,12 +49,12 @@ describe('generateAIContextFiles', () => {
     expect(result.files).toBeDefined();
   });
 
-  it('updates existing CLAUDE.md without duplicating', async () => {
+  it('updates existing CLAUDE.md without duplicating when syncDocs is true', async () => {
     const stats = { nodes: 10 };
 
     // Run twice
-    await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats);
-    await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats);
+    await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats, { syncDocs: true });
+    await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats, { syncDocs: true });
 
     const claudeMdPath = path.join(tmpDir, 'CLAUDE.md');
     const content = await fs.readFile(claudeMdPath, 'utf-8');
