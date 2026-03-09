@@ -276,6 +276,13 @@ export const analyzeCommand = async (
   // ── Phase 5: Finalize (98–100%) ───────────────────────────────────
   updateBar(98, 'Saving metadata...');
 
+  // Count embeddings in the index (cached + newly generated)
+  let embeddingCount = 0;
+  try {
+    const embResult = await executeQuery(`MATCH (e:CodeEmbedding) RETURN count(e) AS cnt`);
+    embeddingCount = embResult?.[0]?.cnt ?? 0;
+  } catch { /* table may not exist if embeddings never ran */ }
+
   const meta = {
     repoPath,
     lastCommit: currentCommit,
@@ -286,6 +293,7 @@ export const analyzeCommand = async (
       edges: stats.edges,
       communities: pipelineResult.communityResult?.stats.totalCommunities,
       processes: pipelineResult.processResult?.stats.totalProcesses,
+      embeddings: embeddingCount,
     },
   };
   await saveMeta(storagePath, meta);
@@ -338,6 +346,7 @@ export const analyzeCommand = async (
 
   if (aiContext.files.length > 0) {
     console.log(`  Context: ${aiContext.files.join(', ')}`);
+    console.log(`  Note: Run \`gitnexus sync-docs\` to materialize metadata into repo documentation.`);
   }
 
   // Show a quiet summary if some edge types needed fallback insertion
@@ -357,8 +366,8 @@ export const analyzeCommand = async (
 
   console.log('');
 
-  // KuzuDB 0.11.3 and ONNX Runtime register native atexit hooks that
-  // segfault / double-free during process shutdown on Node 22+ (and
-  // macOS for ONNX — see #38, #40).  Force-exit to bypass them.
+  // KuzuDB's native module holds open handles that prevent Node from exiting.
+  // ONNX Runtime also registers native atexit hooks that segfault on some
+  // platforms (#38, #40). Force-exit to ensure clean termination.
   process.exit(0);
 };
