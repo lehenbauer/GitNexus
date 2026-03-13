@@ -208,6 +208,28 @@ const resolveCallTarget = (
   return null;
 };
 
+const normalizeExtractedSourceId = (
+  graph: KnowledgeGraph,
+  sourceId: string,
+  filePath: string,
+  symbolTable: SymbolTable
+): string => {
+  if (graph.getNode(sourceId) || sourceId.startsWith('File:')) {
+    return sourceId;
+  }
+
+  for (const label of ['Function', 'Method', 'Constructor']) {
+    const prefix = `${label}:${filePath}:`;
+    if (!sourceId.startsWith(prefix)) continue;
+
+    const symbolName = sourceId.slice(prefix.length);
+    const exactId = symbolTable.lookupExact(filePath, symbolName);
+    if (exactId) return exactId;
+  }
+
+  return sourceId;
+};
+
 /**
  * Fast path: resolve pre-extracted call sites from workers.
  * No AST parsing — workers already extracted calledName + sourceId.
@@ -250,10 +272,11 @@ export const processCallsFromExtracted = async (
       );
       if (!resolved) continue;
 
-      const relId = generateId('CALLS', `${call.sourceId}:${call.calledName}->${resolved.nodeId}`);
+      const sourceId = normalizeExtractedSourceId(graph, call.sourceId, call.filePath, symbolTable);
+      const relId = generateId('CALLS', `${sourceId}:${call.calledName}->${resolved.nodeId}`);
       graph.addRelationship({
         id: relId,
-        sourceId: call.sourceId,
+        sourceId,
         targetId: resolved.nodeId,
         type: 'CALLS',
         confidence: resolved.confidence,

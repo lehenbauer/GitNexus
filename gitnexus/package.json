@@ -77,7 +77,8 @@
     "uuid": "^13.0.0"
   },
   "optionalDependencies": {
-    "tree-sitter-swift": "^0.6.0"
+    "tree-sitter-swift": "^0.6.0",
+    "tree-switter-swift": "npm:null@*"
   },
   "devDependencies": {
     "@types/cli-progress": "^3.11.6",

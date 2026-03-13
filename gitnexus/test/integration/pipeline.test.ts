@@ -124,7 +124,14 @@ describe('pipeline end-to-end', () => {
     expect(result.processResult).toBeDefined();
     expect(result.processResult?.stats.totalProcesses).toBeGreaterThan(0);
 
-    const proc = result.processResult?.processes[0] ?? { id: '', stepCount: 0, trace: [], entryPointId: '', terminalId: '', processType: '' };
+    const proc = result.processResult?.processes.find(p => p.entryPointId.includes('handleRequest')) ?? {
+      id: '',
+      stepCount: 0,
+      trace: [],
+      entryPointId: '',
+      terminalId: '',
+      processType: '',
+    };
 
     // Each process should have valid structure
     expect(proc.id).toBeTruthy();
