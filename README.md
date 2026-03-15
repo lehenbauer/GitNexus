@@ -135,6 +135,8 @@ claude mcp add gitnexus -- npx -y gitnexus@latest mcp
 gitnexus setup                    # Configure MCP for your editors (one-time)
 gitnexus analyze [path]           # Index a repository (or update stale index)
 gitnexus analyze --force          # Force full re-index
+gitnexus analyze --skills         # Generate repo-specific skill files from detected communities
+gitnexus analyze --skip-embeddings  # Skip embedding generation (faster)
 gitnexus analyze --embeddings     # Enable embedding generation (slower, better search)
 gitnexus analyze --verbose        # Log skipped files when parsers are unavailable
 gitnexus mcp                     # Start MCP server (stdio) — serves all indexed repos
@@ -189,6 +191,10 @@ gitnexus wiki --base-url <url>   # Wiki with custom LLM API base URL
 - **Debugging** — Trace bugs through call chains
 - **Impact Analysis** — Analyze blast radius before changes
 - **Refactoring** — Plan safe refactors using dependency mapping
+
+**Repo-specific skills** generated with `--skills`:
+
+When you run `gitnexus analyze --skills`, GitNexus detects the functional areas of your codebase (via Leiden community detection) and generates a `SKILL.md` file for each one under `.claude/skills/generated/`. Each skill describes a module's key files, entry points, execution flows, and cross-area connections — so your AI agent gets targeted context for the exact area of code you're working in. Skills are regenerated on each `--skills` run to stay current with the codebase.
 
 ---
 
@@ -314,14 +320,30 @@ GitNexus builds a complete knowledge graph of your codebase through a multi-phas
 
 1. **Structure** — Walks the file tree and maps folder/file relationships
 2. **Parsing** — Extracts functions, classes, methods, and interfaces using Tree-sitter ASTs
-3. **Resolution** — Resolves imports and function calls across files with language-aware logic
+3. **Resolution** — Resolves imports, function calls, heritage, constructor inference, and `self`/`this` receiver types across files with language-aware logic
 4. **Clustering** — Groups related symbols into functional communities
 5. **Processes** — Traces execution flows from entry points through call chains
 6. **Search** — Builds hybrid search indexes for fast retrieval
 
 ### Supported Languages
 
-TypeScript, JavaScript, Python, Java, Kotlin, C, C++, C#, Go, Rust, PHP, Swift
+| Language | Imports | Named Bindings | Exports | Heritage | Type Annotations | Constructor Inference | Config | Frameworks | Entry Points |
+|----------|---------|----------------|---------|----------|-----------------|---------------------|--------|------------|-------------|
+| TypeScript | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| JavaScript | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ |
+| Python | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Java | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ |
+| Kotlin | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ |
+| C# | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Go | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Rust | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ |
+| PHP | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Ruby | ✓ | — | ✓ | ✓ | — | ✓ | — | ✓ | ✓ |
+| Swift | — | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C | — | — | ✓ | — | ✓ | ✓ | — | ✓ | ✓ |
+| C++ | — | — | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ |
+
+**Imports** — cross-file import resolution · **Named Bindings** — `import { X as Y }` / re-export tracking · **Exports** — public/exported symbol detection · **Heritage** — class inheritance, interfaces, mixins · **Type Annotations** — explicit type extraction for receiver resolution · **Constructor Inference** — infer receiver type from constructor calls (`self`/`this` resolution included for all languages) · **Config** — language toolchain config parsing (tsconfig, go.mod, etc.) · **Frameworks** — AST-based framework pattern detection · **Entry Points** — entry point scoring heuristics
 
 ---
 
@@ -481,9 +503,10 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 
 ### Recently Completed
 
+- [X] Constructor-Inferred Type Resolution, `self`/`this` Receiver Mapping
 - [X] Wiki Generation, Multi-File Rename, Git-Diff Impact Analysis
 - [X] Process-Grouped Search, 360-Degree Context, Claude Code Hooks
-- [X] Multi-Repo MCP, Zero-Config Setup, 11 Language Support
+- [X] Multi-Repo MCP, Zero-Config Setup, 13 Language Support
 - [X] Community Detection, Process Detection, Confidence Scoring
 - [X] Hybrid Search, Vector Index
 

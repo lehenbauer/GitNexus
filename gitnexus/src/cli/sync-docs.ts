@@ -34,8 +34,7 @@ export const syncDocsCommand = async () => {
     gitRoot,
     storagePath,
     projectName,
-    existingMeta.stats,
-    { syncDocs: true }
+    existingMeta.stats
   );
 
   console.log(`  Materialized context into:`);
