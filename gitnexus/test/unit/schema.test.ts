@@ -19,9 +19,9 @@ import {
   RELATION_SCHEMA,
   EMBEDDING_SCHEMA,
   CREATE_VECTOR_INDEX_QUERY,
-} from '../../src/core/kuzu/schema.js';
+} from '../../src/core/lbug/schema.js';
 
-describe('KuzuDB Schema', () => {
+describe('LadybugDB Schema', () => {
   describe('NODE_TABLES', () => {
     it('includes all core node types', () => {
       const core = ['File', 'Folder', 'Function', 'Class', 'Interface', 'Method', 'CodeElement', 'Community', 'Process'];
@@ -40,7 +40,7 @@ describe('KuzuDB Schema', () => {
 
     it('has expected total count', () => {
       // 9 core + 18 multi-language = 27
-      expect(NODE_TABLES).toHaveLength(27);
+      expect(NODE_TABLES).toHaveLength(28);
     });
   });
 
@@ -122,11 +122,11 @@ describe('KuzuDB Schema', () => {
 
     it('has all FROM/TO pairs needed for HAS_METHOD edges', () => {
       // HAS_METHOD sources: Class, Interface, Struct, Trait, Impl, Record
-      // HAS_METHOD targets: Method, Constructor, Property
+      // HAS_METHOD targets: Method, Constructor (Property is now HAS_PROPERTY)
       const sources = ['Class', 'Interface'];
       const backtickSources = ['Struct', 'Trait', 'Impl', 'Record'];
       const targets = ['Method'];
-      const backtickTargets = ['Constructor', 'Property'];
+      const backtickTargets = ['Constructor'];
 
       // Non-backtick source → non-backtick target
       for (const src of sources) {
@@ -164,7 +164,7 @@ describe('KuzuDB Schema', () => {
 
   describe('schema query ordering', () => {
     it('NODE_SCHEMA_QUERIES has correct count', () => {
-      expect(NODE_SCHEMA_QUERIES).toHaveLength(27);
+      expect(NODE_SCHEMA_QUERIES).toHaveLength(28);
     });
 
     it('REL_SCHEMA_QUERIES has one relation table', () => {
@@ -173,7 +173,7 @@ describe('KuzuDB Schema', () => {
 
     it('SCHEMA_QUERIES includes all node + rel + embedding schemas', () => {
       // 27 node + 1 rel + 1 embedding = 29
-      expect(SCHEMA_QUERIES).toHaveLength(29);
+      expect(SCHEMA_QUERIES).toHaveLength(30);
     });
 
     it('node schemas come before relation schemas in SCHEMA_QUERIES', () => {

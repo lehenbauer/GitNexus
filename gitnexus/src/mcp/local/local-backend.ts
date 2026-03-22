@@ -3,18 +3,19 @@
  * 
  * Provides tool implementations using local .gitnexus/ indexes.
  * Supports multiple indexed repositories via a global registry.
- * KuzuDB connections are opened lazily per repo on first query.
+ * LadybugDB connections are opened lazily per repo on first query.
  */
 
 import fs from 'fs/promises';
 import path from 'path';
-import { initKuzu, executeQuery, executeParameterized, closeKuzu, isKuzuReady } from '../core/kuzu-adapter.js';
+import { initLbug, executeQuery, executeParameterized, closeLbug, isLbugReady } from '../core/lbug-adapter.js';
 // Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
 // at MCP server startup — crashes on unsupported Node ABI versions (#89)
 // git utilities available if needed
 // import { isGitRepo, getCurrentCommit, getGitRoot } from '../../storage/git.js';
 import {
   listRegisteredRepos,
+  cleanupOldKuzuFiles,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
 // AI context generation is CLI-only (gitnexus analyze)
@@ -37,7 +38,7 @@ export function isTestFilePath(filePath: string): boolean {
   );
 }
 
-/** Valid KuzuDB node labels for safe Cypher query construction */
+/** Valid LadybugDB node labels for safe Cypher query construction */
 export const VALID_NODE_LABELS = new Set([
   'File', 'Folder', 'Function', 'Class', 'Interface', 'Method', 'CodeElement',
   'Community', 'Process', 'Struct', 'Enum', 'Macro', 'Typedef', 'Union',
@@ -46,7 +47,7 @@ export const VALID_NODE_LABELS = new Set([
 ]);
 
 /** Valid relation types for impact analysis filtering */
-export const VALID_RELATION_TYPES = new Set(['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']);
+export const VALID_RELATION_TYPES = new Set(['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES']);
 
 /** Regex to detect write operations in user-supplied Cypher queries */
 export const CYPHER_WRITE_RE = /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|ALTER|COPY|DETACH)\b/i;
@@ -77,7 +78,7 @@ interface RepoHandle {
   name: string;
   repoPath: string;
   storagePath: string;
-  kuzuPath: string;
+  lbugPath: string;
   indexedAt: string;
   lastCommit: string;
   stats?: RegistryEntry['stats'];
@@ -87,6 +88,8 @@ export class LocalBackend {
   private repos: Map<string, RepoHandle> = new Map();
   private contextCache: Map<string, CodebaseContext> = new Map();
   private initializedRepos: Set<string> = new Set();
+  private reinitPromises: Map<string, Promise<void>> = new Map();
+  private lastStalenessCheck: Map<string, number> = new Map();
 
   // ─── Initialization ──────────────────────────────────────────────
 
@@ -102,7 +105,7 @@ export class LocalBackend {
   /**
    * Re-read the global registry and update the in-memory repo map.
    * New repos are added, existing repos are updated, removed repos are pruned.
-   * KuzuDB connections for removed repos are NOT closed (they idle-timeout naturally).
+   * LadybugDB connections for removed repos are NOT closed (they idle-timeout naturally).
    */
   private async refreshRepos(): Promise<void> {
     const entries = await listRegisteredRepos({ validate: true });
@@ -113,14 +116,21 @@ export class LocalBackend {
       freshIds.add(id);
 
       const storagePath = entry.storagePath;
-      const kuzuPath = path.join(storagePath, 'kuzu');
+      const lbugPath = path.join(storagePath, 'lbug');
+
+      // Clean up any leftover KuzuDB files from before the LadybugDB migration.
+      // If kuzu exists but lbug doesn't, warn so the user knows to re-analyze.
+      const kuzu = await cleanupOldKuzuFiles(storagePath);
+      if (kuzu.found && kuzu.needsReindex) {
+        console.error(`GitNexus: "${entry.name}" has a stale KuzuDB index. Run: gitnexus analyze ${entry.path}`);
+      }
 
       const handle: RepoHandle = {
         id,
         name: entry.name,
         repoPath: entry.path,
         storagePath,
-        kuzuPath,
+        lbugPath,
         indexedAt: entry.indexedAt,
         lastCommit: entry.lastCommit,
         stats: entry.stats,
@@ -128,7 +138,7 @@ export class LocalBackend {
 
       this.repos.set(id, handle);
 
-      // Build lightweight context (no KuzuDB needed)
+      // Build lightweight context (no LadybugDB needed)
       const s = entry.stats || {};
       this.contextCache.set(id, {
         projectName: entry.name,
@@ -235,17 +245,56 @@ export class LocalBackend {
     return null; // Multiple repos, no param — ambiguous
   }
 
-  // ─── Lazy KuzuDB Init ────────────────────────────────────────────
+  // ─── Lazy LadybugDB Init ────────────────────────────────────────────
 
   private async ensureInitialized(repoId: string): Promise<void> {
-    // Always check the actual pool — the idle timer may have evicted the connection
-    if (this.initializedRepos.has(repoId) && isKuzuReady(repoId)) return;
+    // If a reinit is already in progress for this repo, wait for it
+    const pending = this.reinitPromises.get(repoId);
+    if (pending) return pending;
 
     const handle = this.repos.get(repoId);
     if (!handle) throw new Error(`Unknown repo: ${repoId}`);
 
+    // Check if the index was rebuilt since we opened the connection (#297).
+    // Throttle staleness checks to at most once per 5 seconds per repo to
+    // avoid an fs.readFile round-trip on every tool invocation.
+    if (this.initializedRepos.has(repoId) && isLbugReady(repoId)) {
+      const now = Date.now();
+      const lastCheck = this.lastStalenessCheck.get(repoId) ?? 0;
+      if (now - lastCheck < 5000) return; // Checked recently — skip
+
+      this.lastStalenessCheck.set(repoId, now);
+      try {
+        const metaPath = path.join(handle.storagePath, 'meta.json');
+        const metaRaw = await fs.readFile(metaPath, 'utf-8');
+        const meta = JSON.parse(metaRaw);
+        if (meta.indexedAt && meta.indexedAt !== handle.indexedAt) {
+          // Index was rebuilt — close stale connection and re-init.
+          // Wrap in reinitPromises to prevent TOCTOU race where concurrent
+          // callers both detect staleness and double-close the pool.
+          const reinit = (async () => {
+            try {
+              await closeLbug(repoId);
+              this.initializedRepos.delete(repoId);
+              handle.indexedAt = meta.indexedAt;
+              await initLbug(repoId, handle.lbugPath);
+              this.initializedRepos.add(repoId);
+            } finally {
+              this.reinitPromises.delete(repoId);
+            }
+          })();
+          this.reinitPromises.set(repoId, reinit);
+          return reinit;
+        } else {
+          return; // Pool is current
+        }
+      } catch {
+        return; // Can't read meta — assume pool is fine
+      }
+    }
+
     try {
-      await initKuzu(repoId, handle.kuzuPath);
+      await initLbug(repoId, handle.lbugPath);
       this.initializedRepos.add(repoId);
     } catch (err: any) {
       // If lock error, mark as not initialized so next call retries
@@ -534,13 +583,13 @@ export class LocalBackend {
   }
 
   /**
-   * BM25 keyword search helper - uses KuzuDB FTS for always-fresh results
+   * BM25 keyword search helper - uses LadybugDB FTS for always-fresh results
    */
   private async bm25Search(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
-    const { searchFTSFromKuzu } = await import('../../core/search/bm25-index.js');
+    const { searchFTSFromLbug } = await import('../../core/search/bm25-index.js');
     let bm25Results;
     try {
-      bm25Results = await searchFTSFromKuzu(query, limit, repo.id);
+      bm25Results = await searchFTSFromLbug(query, limit, repo.id);
     } catch (err: any) {
       console.error('GitNexus: BM25/FTS search failed (FTS indexes may not exist) -', err.message);
       return [];
@@ -669,8 +718,8 @@ export class LocalBackend {
   private async cypher(repo: RepoHandle, params: { query: string }): Promise<any> {
     await this.ensureInitialized(repo.id);
 
-    if (!isKuzuReady(repo.id)) {
-      return { error: 'KuzuDB not ready. Index may be corrupted.' };
+    if (!isLbugReady(repo.id)) {
+      return { error: 'LadybugDB not ready. Index may be corrupted.' };
     }
 
     // Block write operations (defense-in-depth — DB is already read-only)
@@ -719,7 +768,7 @@ export class LocalBackend {
   /**
    * Aggregate same-named clusters: group by heuristicLabel, sum symbols,
    * weighted-average cohesion, filter out tiny clusters (<5 symbols).
-   * Raw communities stay intact in KuzuDB for Cypher queries.
+   * Raw communities stay intact in LadybugDB for Cypher queries.
    */
   private aggregateClusters(clusters: any[]): any[] {
     const groups = new Map<string, { ids: string[]; totalSymbols: number; weightedCohesion: number; largest: any }>();
@@ -890,7 +939,7 @@ export class LocalBackend {
     // Categorized incoming refs
     const incomingRows = await executeParameterized(repo.id, `
       MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES']
       RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
       LIMIT 30
     `, { symId });
@@ -898,7 +947,7 @@ export class LocalBackend {
     // Categorized outgoing refs
     const outgoingRows = await executeParameterized(repo.id, `
       MATCH (n {id: $symId})-[r:CodeRelation]->(target)
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES']
       RETURN r.type AS relType, target.id AS uid, target.name AS name, target.filePath AS filePath, labels(target)[0] AS kind
       LIMIT 30
     `, { symId });
@@ -1322,6 +1371,29 @@ export class LocalBackend {
     includeTests?: boolean;
     minConfidence?: number;
   }): Promise<any> {
+    try {
+      return await this._impactImpl(repo, params);
+    } catch (err: any) {
+      // Return structured error instead of crashing (#321)
+      return {
+        error: (err instanceof Error ? err.message : String(err)) || 'Impact analysis failed',
+        target: { name: params.target },
+        direction: params.direction,
+        impactedCount: 0,
+        risk: 'UNKNOWN',
+        suggestion: 'The graph query failed — try gitnexus context <symbol> as a fallback',
+      };
+    }
+  }
+
+  private async _impactImpl(repo: RepoHandle, params: {
+    target: string;
+    direction: 'upstream' | 'downstream';
+    maxDepth?: number;
+    relationTypes?: string[];
+    includeTests?: boolean;
+    minConfidence?: number;
+  }): Promise<any> {
     await this.ensureInitialized(repo.id);
     
     const { target, direction } = params;
@@ -1350,6 +1422,7 @@ export class LocalBackend {
     const impacted: any[] = [];
     const visited = new Set<string>([symId]);
     let frontier = [symId];
+    let traversalComplete = true;
     
     for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
       const nextFrontier: string[] = [];
@@ -1383,7 +1456,13 @@ export class LocalBackend {
             });
           }
         }
-      } catch (e) { logQueryError('impact:depth-traversal', e); }
+      } catch (e) {
+        logQueryError('impact:depth-traversal', e);
+        // Break out of depth loop on query failure but return partial results
+        // collected so far, rather than silently swallowing the error (#321)
+        traversalComplete = false;
+        break;
+      }
       
       frontier = nextFrontier;
     }
@@ -1400,31 +1479,51 @@ export class LocalBackend {
     let affectedModules: any[] = [];
 
     if (impacted.length > 0) {
-      const allIds = impacted.map(i => `'${i.id.replace(/'/g, "''")}'`).join(', ');
-      const d1Ids = (grouped[1] || []).map((i: any) => `'${i.id.replace(/'/g, "''")}'`).join(', ');
+      // Cap IN-clause to 100 IDs to prevent oversized queries that crash
+      // the native DB engine on arm64 macOS (#292)
+      const cappedImpacted = impacted.slice(0, 100);
+      const allIds = cappedImpacted.map(i => `'${String(i.id ?? '').replace(/'/g, "''")}'`).join(', ');
+      const d1Items = (grouped[1] || []).slice(0, 100);
+      const d1Ids = d1Items.map((i: any) => `'${String(i.id ?? '').replace(/'/g, "''")}'`).join(', ');
 
-      // Affected processes: which execution flows are broken and at which step
-      const [processRows, moduleRows, directModuleRows] = await Promise.all([
-        executeQuery(repo.id, `
-          MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-          WHERE s.id IN [${allIds}]
-          RETURN p.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep, p.stepCount AS stepCount
-          ORDER BY hits DESC
-          LIMIT 20
-        `).catch(() => []),
-        executeQuery(repo.id, `
-          MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          WHERE s.id IN [${allIds}]
-          RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
-          ORDER BY hits DESC
-          LIMIT 20
-        `).catch(() => []),
-        d1Ids ? executeQuery(repo.id, `
-          MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          WHERE s.id IN [${d1Ids}]
-          RETURN DISTINCT c.heuristicLabel AS name
-        `).catch(() => []) : Promise.resolve([]),
-      ]);
+      // Enrichment queries: sequential on arm64 macOS to avoid SIGSEGV from
+      // concurrent native DB access (#285, #290, #292); parallel elsewhere
+      // to preserve performance on unaffected platforms.
+      const isArm64Mac = process.platform === 'darwin' && process.arch === 'arm64';
+
+      const processQuery = executeQuery(repo.id, `
+        MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+        WHERE s.id IN [${allIds}]
+        RETURN p.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep, p.stepCount AS stepCount
+        ORDER BY hits DESC
+        LIMIT 20
+      `).catch(() => []);
+      const moduleQuery = () => executeQuery(repo.id, `
+        MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+        WHERE s.id IN [${allIds}]
+        RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
+        ORDER BY hits DESC
+        LIMIT 20
+      `).catch(() => []);
+      const directModuleQuery = () => d1Ids
+        ? executeQuery(repo.id, `
+            MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+            WHERE s.id IN [${d1Ids}]
+            RETURN DISTINCT c.heuristicLabel AS name
+          `).catch(() => [])
+        : Promise.resolve([]);
+
+      let processRows: any[], moduleRows: any[], directModuleRows: any[];
+      if (isArm64Mac) {
+        // Sequential: avoid concurrent native DB access
+        processRows = await processQuery;
+        moduleRows = await moduleQuery();
+        directModuleRows = await directModuleQuery();
+      } else {
+        // Parallel: safe on non-arm64 platforms
+        processRows = await processQuery;
+        [moduleRows, directModuleRows] = await Promise.all([moduleQuery(), directModuleQuery()]);
+      }
 
       affectedProcesses = processRows.map((r: any) => ({
         name: r.name || r[0],
@@ -1466,6 +1565,7 @@ export class LocalBackend {
       direction,
       impactedCount: impacted.length,
       risk,
+      ...(!traversalComplete && { partial: true }),
       summary: {
         direct: directCount,
         processes_affected: processCount,
@@ -1622,7 +1722,7 @@ export class LocalBackend {
   }
 
   async disconnect(): Promise<void> {
-    await closeKuzu(); // close all connections
+    await closeLbug(); // close all connections
     // Note: we intentionally do NOT call disposeEmbedder() here.
     // ONNX Runtime's native cleanup segfaults on macOS and some Linux configs,
     // and importing the embedder module on Node v24+ crashes if onnxruntime

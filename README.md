@@ -34,7 +34,7 @@ https://github.com/user-attachments/assets/172685ba-8e54-4ea7-9ad1-e31a3398da72
 
 > *Like DeepWiki, but deeper.* DeepWiki helps you *understand* code. GitNexus lets you *analyze* it — because a knowledge graph tracks every relationship, not just descriptions.
 
-**TL;DR:** The **Web UI** is a quick way to chat with any repo. The **CLI + MCP** is how you make your AI agent actually reliable — it gives Cursor, Claude Code, and friends a deep architectural view of your codebase so they stop missing dependencies, breaking call chains, and shipping blind edits. Even smaller models get full architectural clarity, making it compete with goliath models.
+**TL;DR:** The **Web UI** is a quick way to chat with any repo. The **CLI + MCP** is how you make your AI agent actually reliable — it gives Cursor, Claude Code, Codex, and friends a deep architectural view of your codebase so they stop missing dependencies, breaking call chains, and shipping blind edits. Even smaller models get full architectural clarity, making it compete with goliath models.
 
 ---
 
@@ -48,10 +48,10 @@ https://github.com/user-attachments/assets/172685ba-8e54-4ea7-9ad1-e31a3398da72
 |                   | **CLI + MCP**                                            | **Web UI**                                             |
 | ----------------- | -------------------------------------------------------------- | ------------------------------------------------------------ |
 | **What**    | Index repos locally, connect AI agents via MCP                 | Visual graph explorer + AI chat in browser                   |
-| **For**     | Daily development with Cursor, Claude Code, Windsurf, OpenCode | Quick exploration, demos, one-off analysis                   |
+| **For**     | Daily development with Cursor, Claude Code, Codex, Windsurf, OpenCode | Quick exploration, demos, one-off analysis                   |
 | **Scale**   | Full repos, any size                                           | Limited by browser memory (~5k files), or unlimited via backend mode |
 | **Install** | `npm install -g gitnexus`                                    | No install —[gitnexus.vercel.app](https://gitnexus.vercel.app) |
-| **Storage** | KuzuDB native (fast, persistent)                               | KuzuDB WASM (in-memory, per session)                         |
+| **Storage** | LadybugDB native (fast, persistent)                               | LadybugDB WASM (in-memory, per session)                         |
 | **Parsing** | Tree-sitter native bindings                                    | Tree-sitter WASM                                             |
 | **Privacy** | Everything local, no network                                   | Everything in-browser, no server                             |
 
@@ -84,16 +84,23 @@ To configure MCP for your editor, run `npx gitnexus setup` once — or set it up
 | --------------------- | --- | ------ | -------------------- | -------------- |
 | **Claude Code** | Yes | Yes    | Yes (PreToolUse + PostToolUse) | **Full** |
 | **Cursor**      | Yes | Yes    | —                   | MCP + Skills   |
+| **Codex**       | Yes | Yes    | —                   | MCP + Skills   |
 | **Windsurf**    | Yes | —     | —                   | MCP            |
 | **OpenCode**    | Yes | Yes    | —                   | MCP + Skills   |
+| **Codex**       | Yes | —     | —                   | MCP            |
 
 > **Claude Code** gets the deepest integration: MCP tools + agent skills + PreToolUse hooks that enrich searches with graph context + PostToolUse hooks that auto-reindex after commits.
 
-### Community Integrations
+## Community Integrations
 
-| Agent | Install | Source |
-|-------|---------|--------|
-| [pi](https://pi.dev) | `pi install npm:pi-gitnexus` | [pi-gitnexus](https://github.com/tintinweb/pi-gitnexus) |
+Built by the community — not officially maintained, but worth checking out.
+
+| Project | Author | Description |
+|---------|--------|-------------|
+| [pi-gitnexus](https://github.com/tintinweb/pi-gitnexus) | [@tintinweb](https://github.com/tintinweb) | GitNexus plugin for [pi](https://pi.dev) — `pi install npm:pi-gitnexus` |
+| [gitnexus-stable-ops](https://github.com/ShunsukeHayashi/gitnexus-stable-ops) | [@ShunsukeHayashi](https://github.com/ShunsukeHayashi) | Stable ops & deployment workflows (Miyabi ecosystem) |
+
+> Have a project built on GitNexus? Open a PR to add it here!
 
 If you prefer manual configuration:
 
@@ -101,6 +108,12 @@ If you prefer manual configuration:
 
 ```bash
 claude mcp add gitnexus -- npx -y gitnexus@latest mcp
+```
+
+**Codex** (full support — MCP + skills):
+
+```bash
+codex mcp add gitnexus -- npx -y gitnexus@latest mcp
 ```
 
 **Cursor** (`~/.cursor/mcp.json` — global, works for all projects):
@@ -127,6 +140,14 @@ claude mcp add gitnexus -- npx -y gitnexus@latest mcp
     }
   }
 }
+```
+
+**Codex** (`~/.codex/config.toml` for system scope, or `.codex/config.toml` for project scope):
+
+```toml
+[mcp_servers.gitnexus]
+command = "npx"
+args = ["-y", "gitnexus@latest", "mcp"]
 ```
 
 ### CLI Commands
@@ -224,8 +245,8 @@ flowchart TD
         Server["server.ts"]
         Backend["LocalBackend"]
         Pool["Connection Pool"]
-        ConnA["KuzuDB conn A"]
-        ConnB["KuzuDB conn B"]
+        ConnA["LadybugDB conn A"]
+        ConnB["LadybugDB conn B"]
     end
 
     Setup -->|"writes global MCP config"| CursorConfig["~/.cursor/mcp.json"]
@@ -242,7 +263,7 @@ flowchart TD
     ConnB -->|"queries"| RepoB
 ```
 
-**How it works:** Each `gitnexus analyze` stores the index in `.gitnexus/` inside the repo (portable, gitignored) and registers a pointer in `~/.gitnexus/registry.json`. When an AI agent starts, the MCP server reads the registry and can serve any indexed repo. KuzuDB connections are opened lazily on first query and evicted after 5 minutes of inactivity (max 5 concurrent). If only one repo is indexed, the `repo` parameter is optional on all tools — agents don't need to change anything.
+**How it works:** Each `gitnexus analyze` stores the index in `.gitnexus/` inside the repo (portable, gitignored) and registers a pointer in `~/.gitnexus/registry.json`. When an AI agent starts, the MCP server reads the registry and can serve any indexed repo. LadybugDB connections are opened lazily on first query and evicted after 5 minutes of inactivity (max 5 concurrent). If only one repo is indexed, the `repo` parameter is optional on all tools — agents don't need to change anything.
 
 ---
 
@@ -263,7 +284,7 @@ npm install
 npm run dev
 ```
 
-The web UI uses the same indexing pipeline as the CLI but runs entirely in WebAssembly (Tree-sitter WASM, KuzuDB WASM, in-browser embeddings). It's great for quick exploration but limited by browser memory for larger repos.
+The web UI uses the same indexing pipeline as the CLI but runs entirely in WebAssembly (Tree-sitter WASM, LadybugDB WASM, in-browser embeddings). It's great for quick exploration but limited by browser memory for larger repos.
 
 **Local Backend Mode:** Run `gitnexus serve` and open the web UI locally — it auto-detects the server and shows all your indexed repos, with full AI chat support. No need to re-upload or re-index. The agent's tools (Cypher queries, search, code navigation) route through the backend HTTP API automatically.
 
@@ -271,7 +292,7 @@ The web UI uses the same indexing pipeline as the CLI but runs entirely in WebAs
 
 ## The Problem GitNexus Solves
 
-Tools like **Cursor**, **Claude Code**, **Cline**, **Roo Code**, and **Windsurf** are powerful — but they don't truly know your codebase structure.
+Tools like **Cursor**, **Claude Code**, **Codex**, **Cline**, **Roo Code**, and **Windsurf** are powerful — but they don't truly know your codebase structure.
 
 **What happens:**
 
@@ -482,7 +503,7 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 | ------------------------- | ------------------------------------- | --------------------------------------- |
 | **Runtime**         | Node.js (native)                      | Browser (WASM)                          |
 | **Parsing**         | Tree-sitter native bindings           | Tree-sitter WASM                        |
-| **Database**        | KuzuDB native                         | KuzuDB WASM                             |
+| **Database**        | LadybugDB native                         | LadybugDB WASM                             |
 | **Embeddings**      | HuggingFace transformers.js (GPU/CPU) | transformers.js (WebGPU/WASM)           |
 | **Search**          | BM25 + semantic + RRF                 | BM25 + semantic + RRF                   |
 | **Agent Interface** | MCP (stdio)                           | LangChain ReAct agent                   |
@@ -523,7 +544,7 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 ## Acknowledgments
 
 - [Tree-sitter](https://tree-sitter.github.io/) — AST parsing
-- [KuzuDB](https://kuzudb.com/) — Embedded graph database with vector support
+- [LadybugDB](https://ladybugdb.com/) — Embedded graph database with vector support (formerly KuzuDB)
 - [Sigma.js](https://www.sigmajs.org/) — WebGL graph rendering
 - [transformers.js](https://huggingface.co/docs/transformers.js) — Browser ML
 - [Graphology](https://graphology.github.io/) — Graph data structures

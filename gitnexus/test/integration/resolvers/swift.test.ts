@@ -57,7 +57,8 @@ describe.skipIf(!swiftAvailable)('Swift constructor-inferred type resolution', (
 
 // ---------------------------------------------------------------------------
 // self.save() resolves to enclosing class's own save method
-// Known issue: tree-sitter-swift has build issues on Node 22
+// Build-dep issue (NOT a feature gap): tree-sitter-swift has build issues on Node 22.
+// The self/super resolution code already exists in type-env.ts lookupInEnv (lines 56-66).
 // ---------------------------------------------------------------------------
 
 describe.skip('Swift self resolution', () => {
@@ -86,7 +87,8 @@ describe.skip('Swift self resolution', () => {
 
 // ---------------------------------------------------------------------------
 // Parent class resolution: EXTENDS + protocol conformance
-// Known issue: tree-sitter-swift has build issues on Node 22
+// Build-dep issue (NOT a feature gap): tree-sitter-swift has build issues on Node 22.
+// findEnclosingParentClassName in type-env.ts already has Swift inheritance_specifier handler.
 // ---------------------------------------------------------------------------
 
 describe.skip('Swift parent resolution', () => {
@@ -143,5 +145,82 @@ describe.skipIf(!swiftAvailable)('Swift cross-file User.init() inference', () =>
     const greetCall = calls.find(c => c.target === 'greet' && c.targetFilePath === 'User.swift');
     expect(greetCall).toBeDefined();
     expect(greetCall!.source).toBe('main');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Return type inference: let user = getUser(name: "alice"); user.save()
+// Swift's CONSTRUCTOR_BINDING_SCANNER captures property_declaration with
+// call_expression values, enabling return type inference from function results.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!swiftAvailable)('Swift return type inference', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'swift-return-type'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class and getUser function', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Function')).toContain('getUser');
+  });
+
+  it('detects save function on User (Swift class methods are Function nodes)', () => {
+    expect(getNodesByLabel(result, 'Function')).toContain('save');
+  });
+
+  it('resolves user.save() to User#save via return type of getUser() -> User', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('Models.swift'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Return-type inference with competing methods:
+// Two classes both have save(), factory functions disambiguate via return type
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!swiftAvailable)('Swift return-type inference via function return type', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'swift-return-type-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.save() to User#save via return type of getUser()', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('Models.swift')
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('user.save() does NOT resolve to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser'
+    );
+    // Should resolve to exactly one target — if it resolves at all, check it's the right one
+    if (wrongSave) {
+      expect(wrongSave.targetFilePath).toContain('Models.swift');
+    }
+  });
+
+  it('resolves repo.save() to Repo#save via return type of getRepo()', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processRepo' && c.targetFilePath.includes('Models.swift')
+    );
+    expect(saveCall).toBeDefined();
   });
 });

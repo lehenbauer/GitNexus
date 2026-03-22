@@ -66,3 +66,12 @@ gitnexus/test/fixtures/mini-repo/.gitignore
 
 # Tarball artifacts
 *.tgz
+
+# Ignore csharp generated obj and bin folders
+gitnexus/test/fixtures/lang-resolution/**/obj
+gitnexus/test/fixtures/lang-resolution/**/bin
+GitNexus.sln
+# Git worktrees
+.worktrees/
+
+/github/scripts/triage/__pycache__/
