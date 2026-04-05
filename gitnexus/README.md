@@ -53,7 +53,11 @@ If you prefer to configure manually instead of using `gitnexus setup`:
 ### Claude Code (full support — MCP + skills + hooks)
 
 ```bash
+# macOS / Linux
 claude mcp add gitnexus -- npx -y gitnexus@latest mcp
+
+# Windows
+claude mcp add gitnexus -- cmd /c npx -y gitnexus@latest mcp
 ```
 
 ### Codex (full support — MCP + skills)
@@ -99,6 +103,8 @@ GitNexus builds a complete knowledge graph of your codebase through a multi-phas
 1. **Structure** — Walks the file tree and maps folder/file relationships
 2. **Parsing** — Extracts functions, classes, methods, and interfaces using Tree-sitter ASTs
 3. **Resolution** — Resolves imports and function calls across files with language-aware logic
+   - **Field & Property Type Resolution** — Tracks field types across classes and interfaces for deep chain resolution (e.g., `user.address.city.getName()`)
+   - **Return-Type-Aware Variable Binding** — Infers variable types from function return types, enabling accurate call-result binding
 4. **Clustering** — Groups related symbols into functional communities
 5. **Processes** — Traces execution flows from entry points through call chains
 6. **Search** — Builds hybrid search indexes for fast retrieval
@@ -143,20 +149,46 @@ Your AI agent gets these tools automatically:
 ## CLI Commands
 
 ```bash
-gitnexus setup                    # Configure MCP for your editors (one-time)
-gitnexus analyze [path]           # Index a repository (or update stale index)
-gitnexus analyze --force          # Force full re-index
-gitnexus analyze --embeddings     # Enable embedding generation (slower, better search)
-gitnexus analyze --verbose        # Log skipped files when parsers are unavailable
+gitnexus setup                   # Configure MCP for your editors (one-time)
+gitnexus analyze [path]          # Index a repository (or update stale index)
+gitnexus analyze --force         # Force full re-index
+gitnexus analyze --embeddings    # Enable embedding generation (slower, better search)
+gitnexus analyze --skip-agents-md  # Preserve custom AGENTS.md/CLAUDE.md gitnexus section edits
+gitnexus analyze --verbose       # Log skipped files when parsers are unavailable
 gitnexus mcp                     # Start MCP server (stdio) — serves all indexed repos
 gitnexus serve                   # Start local HTTP server (multi-repo) for web UI
+gitnexus index                   # Register an existing .gitnexus/ folder into the global registry
 gitnexus list                    # List all indexed repositories
 gitnexus status                  # Show index status for current repo
 gitnexus clean                   # Delete index for current repo
 gitnexus clean --all --force     # Delete all indexes
 gitnexus wiki [path]             # Generate LLM-powered docs from knowledge graph
 gitnexus wiki --model <model>    # Wiki with custom LLM model (default: gpt-4o-mini)
+
+# Repository groups (multi-repo / monorepo service tracking)
+gitnexus group create <name>     # Create a repository group
+gitnexus group add <name> <repo> # Add a repo to a group
+gitnexus group remove <name> <repo> # Remove a repo from a group
+gitnexus group list [name]       # List groups, or show one group's config
+gitnexus group sync <name>       # Extract contracts and match across repos/services
+gitnexus group contracts <name>  # Inspect extracted contracts and cross-links
+gitnexus group query <name> <q>  # Search execution flows across all repos in a group
+gitnexus group status <name>     # Check staleness of repos in a group
 ```
+
+## Remote Embeddings
+
+Set these env vars to use a remote OpenAI-compatible `/v1/embeddings` endpoint instead of the local model:
+
+```bash
+export GITNEXUS_EMBEDDING_URL=http://your-server:8080/v1
+export GITNEXUS_EMBEDDING_MODEL=BAAI/bge-large-en-v1.5
+export GITNEXUS_EMBEDDING_DIMS=1024          # optional, default 384
+export GITNEXUS_EMBEDDING_API_KEY=your-key   # optional, default: "unused"
+gitnexus analyze . --embeddings
+```
+
+Works with Infinity, vLLM, TEI, llama.cpp, Ollama, LM Studio, or OpenAI. When unset, local embeddings are used unchanged.
 
 ## Multi-Repo Support
 

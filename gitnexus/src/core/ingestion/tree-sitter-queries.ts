@@ -1,16 +1,17 @@
-import { SupportedLanguages } from '../../config/supported-languages.js';
-
-/* 
+/*
  * Tree-sitter queries for extracting code definitions.
- * 
+ *
  * Note: Different grammars (typescript vs tsx vs javascript) may have
- * slightly different node types. These queries are designed to be 
+ * slightly different node types. These queries are designed to be
  * compatible with the standard tree-sitter grammars.
  */
 
 // TypeScript queries - works with tree-sitter-typescript
 export const TYPESCRIPT_QUERIES = `
 (class_declaration
+  name: (type_identifier) @name) @definition.class
+
+(abstract_class_declaration
   name: (type_identifier) @name) @definition.class
 
 (interface_declaration
@@ -24,6 +25,18 @@ export const TYPESCRIPT_QUERIES = `
   name: (identifier) @name) @definition.function
 
 (method_definition
+  name: (property_identifier) @name) @definition.method
+
+; ES2022 #private methods (private_property_identifier not matched by property_identifier)
+(method_definition
+  name: (private_property_identifier) @name) @definition.method
+
+; Abstract method signatures in abstract classes
+(abstract_method_signature
+  name: (property_identifier) @name) @definition.method
+
+; Interface method signatures
+(method_signature
   name: (property_identifier) @name) @definition.method
 
 (lexical_declaration
@@ -106,6 +119,34 @@ export const TYPESCRIPT_QUERIES = `
     object: (_) @assignment.receiver
     property: (property_identifier) @assignment.property)
   right: (_)) @assignment
+
+; HTTP consumers: fetch('/path'), axios.get('/path'), $.get('/path'), etc.
+; fetch() — global function
+(call_expression
+  function: (identifier) @_fetch_fn (#eq? @_fetch_fn "fetch")
+  arguments: (arguments
+    [(string (string_fragment) @route.url)
+     (template_string) @route.template_url])) @route.fetch
+
+; axios.get/post/put/delete/patch('/path'), $.get/post/ajax({url:'/path'})
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @http_client.method)
+  arguments: (arguments
+    (string (string_fragment) @http_client.url))) @http_client
+
+; Decorators: @Controller, @Get, @Post, etc.
+(decorator
+  (call_expression
+    function: (identifier) @decorator.name
+    arguments: (arguments (string (string_fragment) @decorator.arg)?))) @decorator
+
+; Express/Hono route registration: app.get('/path', handler), router.post('/path', fn)
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @express_route.method)
+  arguments: (arguments
+    (string (string_fragment) @express_route.path))) @express_route
 `;
 
 // JavaScript queries - works with tree-sitter-javascript
@@ -118,6 +159,10 @@ export const JAVASCRIPT_QUERIES = `
 
 (method_definition
   name: (property_identifier) @name) @definition.method
+
+; ES2022 #private methods
+(method_definition
+  name: (private_property_identifier) @name) @definition.method
 
 (lexical_declaration
   (variable_declarator
@@ -183,6 +228,27 @@ export const JAVASCRIPT_QUERIES = `
     object: (_) @assignment.receiver
     property: (property_identifier) @assignment.property)
   right: (_)) @assignment
+
+; HTTP consumers: fetch('/path'), axios.get('/path'), $.get('/path'), etc.
+(call_expression
+  function: (identifier) @_fetch_fn (#eq? @_fetch_fn "fetch")
+  arguments: (arguments
+    [(string (string_fragment) @route.url)
+     (template_string) @route.template_url])) @route.fetch
+
+; axios.get/post, $.get/post/ajax
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @http_client.method)
+  arguments: (arguments
+    (string (string_fragment) @http_client.url))) @http_client
+
+; Express/Hono route registration
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @express_route.method)
+  arguments: (arguments
+    (string (string_fragment) @express_route.path))) @express_route
 `;
 
 // Python queries - works with tree-sitter-python
@@ -195,6 +261,12 @@ export const PYTHON_QUERIES = `
 
 (import_statement
   name: (dotted_name) @import.source) @import
+
+; import numpy as np  →  aliased_import captures the module name so the
+; import path is resolved and named-binding extraction stores "np" → "numpy".
+(import_statement
+  name: (aliased_import
+    name: (dotted_name) @import.source)) @import
 
 (import_from_statement
   module_name: (dotted_name) @import.source) @import
@@ -236,6 +308,22 @@ export const PYTHON_QUERIES = `
     object: (_) @assignment.receiver
     attribute: (identifier) @assignment.property)
   right: (_)) @assignment
+
+; Python HTTP clients: requests.get('/path'), httpx.post('/path'), session.get('/path')
+(call
+  function: (attribute
+    attribute: (identifier) @http_client.method)
+  arguments: (argument_list
+    (string (string_content) @http_client.url))) @http_client
+
+; Python decorators: @app.route, @router.get, etc.
+(decorator
+  (call
+    function: (attribute
+      object: (identifier) @decorator.receiver
+      attribute: (identifier) @decorator.name)
+    arguments: (argument_list
+      (string (string_content) @decorator.arg)?))) @decorator
 `;
 
 // Java queries - works with tree-sitter-java
@@ -261,6 +349,7 @@ export const JAVA_QUERIES = `
 ; Calls
 (method_invocation name: (identifier) @call.name) @call
 (method_invocation object: (_) name: (identifier) @call.name) @call
+(method_reference) @call
 
 ; Constructor calls: new Foo()
 (object_creation_expression type: (type_identifier) @call.name) @call
@@ -546,6 +635,7 @@ export const CSHARP_QUERIES = `
 export const RUST_QUERIES = `
 ; Functions & Items
 (function_item name: (identifier) @name) @definition.function
+(function_signature_item name: (identifier) @name) @definition.function
 (struct_item name: (type_identifier) @name) @definition.struct
 (enum_item name: (type_identifier) @name) @definition.enum
 (trait_item name: (type_identifier) @name) @definition.trait
@@ -685,6 +775,12 @@ export const PHP_QUERIES = `
     (use_declaration
       [(name) (qualified_name)] @heritage.trait))) @heritage
 
+; PHP HTTP consumers: file_get_contents('/path'), curl_init('/path')
+(function_call_expression
+  function: (name) @_php_http (#match? @_php_http "^(file_get_contents|curl_init)$")
+  arguments: (arguments
+    (argument (string (string_content) @http_client.url)))) @http_client
+
 ; Write access: $obj->field = value
 (assignment_expression
   left: (member_access_expression
@@ -732,7 +828,7 @@ export const RUBY_QUERIES = `
 ; NOTE: This may over-capture variable reads as calls (e.g. 'result' at
 ; statement level). Ruby's grammar makes bare identifiers ambiguous — they
 ; could be local variables or zero-arity method calls. Post-processing via
-; isBuiltInOrNoise and symbol resolution filtering suppresses most false
+; provider.isBuiltInName and symbol resolution filtering suppresses most false
 ; positives, but a variable name that coincidentally matches a method name
 ; elsewhere may produce a false CALLS edge.
 (body_statement
@@ -889,6 +985,9 @@ export const SWIFT_QUERIES = `
 ; Properties (stored and computed)
 (property_declaration (pattern (simple_identifier) @name)) @definition.property
 
+; Enum cases
+(enum_entry (simple_identifier) @name) @definition.property
+
 ; Imports
 (import_declaration (identifier (simple_identifier) @import.source)) @import
 
@@ -911,15 +1010,171 @@ export const SWIFT_QUERIES = `
 (class_declaration "extension" name: (user_type (type_identifier) @heritage.class)
   (inheritance_specifier inherits_from: (user_type (type_identifier) @heritage.extends))) @heritage
 
-; Write access: obj.field = value
+; Write access: obj.field = value (tree-sitter-swift 0.7.1 uses named fields)
 (assignment
-  (directly_assignable_expression
-    (_) @assignment.receiver
-    (navigation_suffix
-      (simple_identifier) @assignment.property))
-  (_)) @assignment
+  target: (directly_assignable_expression
+    (navigation_expression
+      target: (_) @assignment.receiver
+      suffix: (navigation_suffix
+        suffix: (simple_identifier) @assignment.property)))
+  result: (_)) @assignment
 
 `;
+
+// Dart queries - works with tree-sitter-dart (UserNobody14/tree-sitter-dart, ABI 14)
+// Note: Dart grammar has function_signature/method_signature as wrappers;
+// top-level functions are (program > function_signature),
+// methods inside classes are (method_signature > function_signature).
+// We match top-level functions via (program (function_signature ...)) to avoid
+// double-counting methods that also contain function_signature.
+export const DART_QUERIES = `
+; ── Classes ──────────────────────────────────────────────────────────────────
+(class_definition
+  name: (identifier) @name) @definition.class
+
+; ── Mixins ───────────────────────────────────────────────────────────────────
+(mixin_declaration
+  (identifier) @name) @definition.trait
+
+; ── Extensions ───────────────────────────────────────────────────────────────
+(extension_declaration
+  name: (identifier) @name) @definition.class
+
+; ── Enums ────────────────────────────────────────────────────────────────────
+(enum_declaration
+  name: (identifier) @name) @definition.enum
+
+; ── Type aliases ─────────────────────────────────────────────────────────────
+; Anchor "=" after the name to avoid capturing the RHS type
+(type_alias
+  (type_identifier) @name
+  "=") @definition.type
+
+; ── Top-level functions (parent is program, not method_signature) ────────────
+(program
+  (function_signature
+    name: (identifier) @name) @definition.function)
+
+; ── Abstract method declarations (function_signature inside class body declaration) ──
+(declaration
+  (function_signature
+    name: (identifier) @name)) @definition.method
+
+; ── Methods (inside class/mixin/extension bodies) ────────────────────────────
+(method_signature
+  (function_signature
+    name: (identifier) @name)) @definition.method
+
+; ── Constructors ─────────────────────────────────────────────────────────────
+(constructor_signature
+  name: (identifier) @name) @definition.constructor
+
+; ── Factory constructors (anchor before param list to capture variant name, not class) ──
+(method_signature
+  (factory_constructor_signature
+    (identifier) @name . (formal_parameter_list))) @definition.constructor
+
+; ── Field declarations (String name = '', Address address = Address()) ──────
+(declaration
+  (type_identifier)
+  (initialized_identifier_list
+    (initialized_identifier
+      (identifier) @name))) @definition.property
+
+; ── Nullable field declarations (String? name) ──────────────────────────────
+(declaration
+  (nullable_type)
+  (initialized_identifier_list
+    (initialized_identifier
+      (identifier) @name))) @definition.property
+
+; ── Getters ──────────────────────────────────────────────────────────────────
+(method_signature
+  (getter_signature
+    name: (identifier) @name)) @definition.property
+
+; ── Setters ──────────────────────────────────────────────────────────────────
+(method_signature
+  (setter_signature
+    name: (identifier) @name)) @definition.property
+
+; ── Imports ──────────────────────────────────────────────────────────────────
+(import_or_export
+  (library_import
+    (import_specification
+      (configurable_uri) @import.source))) @import
+
+; ── Calls: direct function/constructor calls (identifier immediately before argument_part) ──
+(expression_statement
+  (identifier) @call.name
+  .
+  (selector (argument_part))) @call
+
+; ── Calls: method calls (obj.method()) ───────────────────────────────────────
+(expression_statement
+  (selector
+    (unconditional_assignable_selector
+      (identifier) @call.name))) @call
+
+; ── Calls: in return statements (return User()) ─────────────────────────────
+(return_statement
+  (identifier) @call.name
+  (selector (argument_part))) @call
+
+; ── Calls: in variable assignments (var x = getUser()) ──────────────────────
+(initialized_variable_definition
+  value: (identifier) @call.name
+  (selector (argument_part))) @call
+
+; ── Calls: member calls in variable assignments (var x = obj.method()) ──────
+(initialized_variable_definition
+  (selector
+    (unconditional_assignable_selector
+      (identifier) @call.name))
+  (selector (argument_part))) @call
+
+; ── Re-exports (export 'foo.dart') ───────────────────────────────────────────
+(import_or_export
+  (library_export
+    (configurable_uri) @import.source)) @import
+
+; ── Write access: obj.field = value ──────────────────────────────────────────
+(assignment_expression
+  left: (assignable_expression
+    (identifier) @assignment.receiver
+    (unconditional_assignable_selector
+      (identifier) @assignment.property))
+  right: (_)) @assignment
+
+; ── Write access: this.field = value ─────────────────────────────────────────
+(assignment_expression
+  left: (assignable_expression
+    (this) @assignment.receiver
+    (unconditional_assignable_selector
+      (identifier) @assignment.property))
+  right: (_)) @assignment
+
+; ── Heritage: extends ────────────────────────────────────────────────────────
+(class_definition
+  name: (identifier) @heritage.class
+  superclass: (superclass
+    (type_identifier) @heritage.extends)) @heritage
+
+; ── Heritage: implements ─────────────────────────────────────────────────────
+(class_definition
+  name: (identifier) @heritage.class
+  interfaces: (interfaces
+    (type_identifier) @heritage.implements)) @heritage.impl
+
+; ── Heritage: with (mixins) ──────────────────────────────────────────────────
+(class_definition
+  name: (identifier) @heritage.class
+  superclass: (superclass
+    (mixins
+      (type_identifier) @heritage.trait))) @heritage
+`;
+
+import { SupportedLanguages } from 'gitnexus-shared';
 
 export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
   [SupportedLanguages.TypeScript]: TYPESCRIPT_QUERIES,
@@ -930,10 +1185,12 @@ export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
   [SupportedLanguages.Go]: GO_QUERIES,
   [SupportedLanguages.CPlusPlus]: CPP_QUERIES,
   [SupportedLanguages.CSharp]: CSHARP_QUERIES,
-  [SupportedLanguages.Ruby]: RUBY_QUERIES,
   [SupportedLanguages.Rust]: RUST_QUERIES,
   [SupportedLanguages.PHP]: PHP_QUERIES,
   [SupportedLanguages.Kotlin]: KOTLIN_QUERIES,
+  [SupportedLanguages.Ruby]: RUBY_QUERIES,
   [SupportedLanguages.Swift]: SWIFT_QUERIES,
+  [SupportedLanguages.Dart]: DART_QUERIES,
+  [SupportedLanguages.Vue]: TYPESCRIPT_QUERIES, // Vue <script> blocks are parsed as TypeScript
+  [SupportedLanguages.Cobol]: '', // Standalone regex processor — no tree-sitter queries
 };
- 

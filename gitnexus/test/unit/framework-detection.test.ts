@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { detectFrameworkFromPath, detectFrameworkFromAST, FRAMEWORK_AST_PATTERNS } from '../../src/core/ingestion/framework-detection.js';
+import {
+  detectFrameworkFromPath,
+  detectFrameworkFromAST,
+  FRAMEWORK_AST_PATTERNS,
+} from '../../src/core/ingestion/framework-detection.js';
 
 describe('detectFrameworkFromPath', () => {
   describe('Next.js', () => {
@@ -36,6 +40,28 @@ describe('detectFrameworkFromPath', () => {
       const result = detectFrameworkFromPath('app/layout.tsx');
       expect(result).not.toBeNull();
       expect(result!.entryPointMultiplier).toBe(2.0);
+    });
+  });
+
+  describe('Expo Router', () => {
+    it('detects _layout files', () => {
+      const result = detectFrameworkFromPath('app/_layout.tsx');
+      expect(result).not.toBeNull();
+      expect(result!.framework).toBe('expo-router');
+      expect(result!.reason).toBe('expo-layout');
+    });
+    it('detects +api routes', () => {
+      const result = detectFrameworkFromPath('app/users+api.ts');
+      expect(result).not.toBeNull();
+      expect(result!.framework).toBe('expo-router');
+      expect(result!.reason).toBe('expo-api-route');
+    });
+    it('detects screen files', () => {
+      const result = detectFrameworkFromPath('app/(tabs)/settings.tsx');
+      expect(result).not.toBeNull();
+      expect(result!.framework).toBe('expo-router');
+      expect(result!.reason).toBe('expo-screen');
+      expect(result!.entryPointMultiplier).toBe(2.5);
     });
   });
 
@@ -299,7 +325,10 @@ describe('detectFrameworkFromAST', () => {
   });
 
   it('detects Laravel route definitions in PHP', () => {
-    const result = detectFrameworkFromAST('php', "Route::get('/users', [UserController::class, 'index'])");
+    const result = detectFrameworkFromAST(
+      'php',
+      "Route::get('/users', [UserController::class, 'index'])",
+    );
     expect(result).not.toBeNull();
     expect(result!.framework).toBe('laravel');
   });
@@ -318,19 +347,52 @@ describe('detectFrameworkFromAST', () => {
     const result = detectFrameworkFromAST('TypeScript', '@controller("/")');
     expect(result).not.toBeNull();
   });
+
+  it('detects Expo Router useRouter hook', () => {
+    const result = detectFrameworkFromAST('typescript', 'const router = useRouter()');
+    expect(result).not.toBeNull();
+    expect(result!.framework).toBe('expo-router');
+  });
+  it('detects Expo Router router.push', () => {
+    const result = detectFrameworkFromAST('javascript', "router.push('/settings')");
+    expect(result).not.toBeNull();
+    expect(result!.framework).toBe('expo-router');
+  });
 });
 
 describe('FRAMEWORK_AST_PATTERNS', () => {
   it('has patterns for all expected frameworks', () => {
     const expectedFrameworks = [
-      'nestjs', 'express', 'fastapi', 'flask', 'spring', 'jaxrs',
-      'aspnet', 'go-http', 'gin', 'echo', 'fiber', 'go-grpc',
-      'laravel', 'actix', 'axum', 'rocket', 'tokio', 'qt',
-      'uikit', 'swiftui', 'vapor', 'rails', 'sinatra',
+      'nestjs',
+      'expo-router',
+      'express',
+      'fastapi',
+      'flask',
+      'spring',
+      'jaxrs',
+      'aspnet',
+      'go-http',
+      'gin',
+      'echo',
+      'fiber',
+      'go-grpc',
+      'laravel',
+      'actix',
+      'axum',
+      'rocket',
+      'tokio',
+      'qt',
+      'uikit',
+      'swiftui',
+      'vapor',
+      'rails',
+      'sinatra',
     ];
     for (const fw of expectedFrameworks) {
       expect(FRAMEWORK_AST_PATTERNS).toHaveProperty(fw);
-      expect(FRAMEWORK_AST_PATTERNS[fw as keyof typeof FRAMEWORK_AST_PATTERNS].length).toBeGreaterThan(0);
+      expect(
+        FRAMEWORK_AST_PATTERNS[fw as keyof typeof FRAMEWORK_AST_PATTERNS].length,
+      ).toBeGreaterThan(0);
     }
   });
 });

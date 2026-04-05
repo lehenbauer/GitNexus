@@ -1,12 +1,35 @@
-import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, ReturnTypeExtractor, PendingAssignmentExtractor, PendingAssignment, ForLoopExtractor, PatternBindingExtractor, LiteralTypeInferrer } from './types.js';
-import { extractSimpleTypeName, extractVarName, hasTypeAnnotation, unwrapAwait, extractCalleeName, extractElementTypeFromString, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, type TypeArgPosition } from './shared.js';
+import type { SyntaxNode } from '../utils/ast-helpers.js';
+import type {
+  LanguageTypeConfig,
+  ParameterExtractor,
+  TypeBindingExtractor,
+  InitializerExtractor,
+  ClassNameLookup,
+  ConstructorBindingScanner,
+  PendingAssignmentExtractor,
+  PendingAssignment,
+  ForLoopExtractor,
+  PatternBindingExtractor,
+  LiteralTypeInferrer,
+} from './types.js';
+import {
+  extractSimpleTypeName,
+  extractVarName,
+  hasTypeAnnotation,
+  unwrapAwait,
+  extractCalleeName,
+  extractElementTypeFromString,
+  extractGenericTypeArgs,
+  resolveIterableElementType,
+  methodToTypeArgPosition,
+  type TypeArgPosition,
+} from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
   'lexical_declaration',
   'variable_declaration',
-  'function_declaration',   // JSDoc @param on function declarations
-  'method_definition',      // JSDoc @param on class methods
+  'function_declaration', // JSDoc @param on function declarations
+  'method_definition', // JSDoc @param on class methods
   'public_field_definition', // class field: private users: User[]
 ]);
 
@@ -15,9 +38,10 @@ const normalizeJsDocType = (raw: string): string | undefined => {
   // Strip JSDoc nullable/non-nullable prefixes: ?User → User, !User → User
   if (type.startsWith('?') || type.startsWith('!')) type = type.slice(1);
   // Strip union with null/undefined/void: User|null → User
-  const parts = type.split('|').map(p => p.trim()).filter(p =>
-    p !== 'null' && p !== 'undefined' && p !== 'void'
-  );
+  const parts = type
+    .split('|')
+    .map((p) => p.trim())
+    .filter((p) => p !== 'null' && p !== 'undefined' && p !== 'void');
   if (parts.length !== 1) return undefined; // ambiguous union
   type = parts[0];
   // Strip module: prefix — module:models.User → models.User
@@ -71,7 +95,10 @@ const collectJsDocParams = (funcNode: SyntaxNode): Map<string, string> => {
  * TypeScript: const x: Foo = ..., let x: Foo
  * Also: JSDoc @param annotations on function/method definitions (for .js files).
  */
-const extractDeclaration: TypeBindingExtractor = (node: SyntaxNode, env: Map<string, string>): void => {
+const extractDeclaration: TypeBindingExtractor = (
+  node: SyntaxNode,
+  env: Map<string, string>,
+): void => {
   // JSDoc @param on functions/methods — pre-populate env with param types
   if (node.type === 'function_declaration' || node.type === 'method_definition') {
     const jsDocParams = collectJsDocParams(node);
@@ -126,7 +153,11 @@ const extractParameter: ParameterExtractor = (node: SyntaxNode, env: Map<string,
 };
 
 /** TypeScript: const x = new User() — infer type from new_expression */
-const extractInitializer: InitializerExtractor = (node: SyntaxNode, env: Map<string, string>, _classNames: ClassNameLookup): void => {
+const extractInitializer: InitializerExtractor = (
+  node: SyntaxNode,
+  env: Map<string, string>,
+  _classNames: ClassNameLookup,
+): void => {
   for (let i = 0; i < node.namedChildCount; i++) {
     const declarator = node.namedChild(i);
     if (declarator?.type !== 'variable_declarator') continue;
@@ -166,52 +197,16 @@ const scanConstructorBinding: ConstructorBindingScanner = (node) => {
   return { varName: nameNode.text, calleeName };
 };
 
-/** Regex to extract @returns or @return from JSDoc comments: `@returns {Type}` */
-const JSDOC_RETURN_RE = /@returns?\s*\{([^}]+)\}/;
-
-/**
- * Minimal sanitization for JSDoc return types — preserves generic wrappers
- * (e.g. `Promise<User>`) so that extractReturnTypeName in call-processor
- * can apply WRAPPER_GENERICS unwrapping. Unlike normalizeJsDocType (which
- * strips generics), this only strips JSDoc-specific syntax markers.
- */
-const sanitizeReturnType = (raw: string): string | undefined => {
-  let type = raw.trim();
-  // Strip JSDoc nullable/non-nullable prefixes: ?User → User, !User → User
-  if (type.startsWith('?') || type.startsWith('!')) type = type.slice(1);
-  // Strip module: prefix — module:models.User → models.User
-  if (type.startsWith('module:')) type = type.slice(7);
-  // Reject unions (ambiguous)
-  if (type.includes('|')) return undefined;
-  if (!type) return undefined;
-  return type;
-};
-
-/**
- * Extract return type from JSDoc `@returns {Type}` or `@return {Type}` annotation
- * preceding a function/method definition. Walks backwards through preceding siblings
- * looking for comment nodes containing the annotation.
- */
-const extractReturnType: ReturnTypeExtractor = (node) => {
-  let sibling = node.previousSibling;
-  while (sibling) {
-    if (sibling.type === 'comment') {
-      const match = JSDOC_RETURN_RE.exec(sibling.text);
-      if (match) return sanitizeReturnType(match[1]);
-    } else if (sibling.isNamed && sibling.type !== 'decorator') break;
-    sibling = sibling.previousSibling;
-  }
-  return undefined;
-};
-
-const FOR_LOOP_NODE_TYPES: ReadonlySet<string> = new Set([
-  'for_in_statement',
-]);
+const FOR_LOOP_NODE_TYPES: ReadonlySet<string> = new Set(['for_in_statement']);
 
 /** TS function/method node types that carry a parameters list. */
 const TS_FUNCTION_NODE_TYPES = new Set([
-  'function_declaration', 'function_expression', 'arrow_function',
-  'method_definition', 'generator_function', 'generator_function_declaration',
+  'function_declaration',
+  'function_expression',
+  'arrow_function',
+  'method_definition',
+  'generator_function',
+  'generator_function_declaration',
 ]);
 
 /**
@@ -221,12 +216,17 @@ const TS_FUNCTION_NODE_TYPES = new Set([
  *   type_annotation ": Array<User>"  →  generic_type → extractGenericTypeArgs → "User"
  * Falls back to text-based extraction via extractElementTypeFromString.
  */
-const extractTsElementTypeFromAnnotation = (typeAnnotation: SyntaxNode, pos: TypeArgPosition = 'last', depth = 0): string | undefined => {
+const extractTsElementTypeFromAnnotation = (
+  typeAnnotation: SyntaxNode,
+  pos: TypeArgPosition = 'last',
+  depth = 0,
+): string | undefined => {
   if (depth > 50) return undefined;
   // Unwrap type_annotation (the node text includes ': ' prefix)
-  const inner = typeAnnotation.type === 'type_annotation'
-    ? (typeAnnotation.firstNamedChild ?? typeAnnotation)
-    : typeAnnotation;
+  const inner =
+    typeAnnotation.type === 'type_annotation'
+      ? (typeAnnotation.firstNamedChild ?? typeAnnotation)
+      : typeAnnotation;
 
   // readonly User[] — readonly_type wraps array_type: unwrap and recurse
   if (inner.type === 'readonly_type') {
@@ -288,7 +288,11 @@ const findTsLocalDeclElementType = (
  * for a variable named `iterableName` with a container type annotation.
  * Returns the element type extracted from the annotation, or undefined.
  */
-const findTsIterableElementType = (iterableName: string, startNode: SyntaxNode, pos: TypeArgPosition = 'last'): string | undefined => {
+const findTsIterableElementType = (
+  iterableName: string,
+  startNode: SyntaxNode,
+  pos: TypeArgPosition = 'last',
+): string | undefined => {
   let current: SyntaxNode | null = startNode.parent;
   // Capture the immediate statement_block parent to search local declarations
   const blockNode = current?.type === 'statement_block' ? current : null;
@@ -296,8 +300,8 @@ const findTsIterableElementType = (iterableName: string, startNode: SyntaxNode, 
   while (current) {
     if (TS_FUNCTION_NODE_TYPES.has(current.type)) {
       // Search function parameters
-      const paramsNode = current.childForFieldName('parameters')
-        ?? current.childForFieldName('formal_parameters');
+      const paramsNode =
+        current.childForFieldName('parameters') ?? current.childForFieldName('formal_parameters');
       if (paramsNode) {
         for (let i = 0; i < paramsNode.namedChildCount; i++) {
           const param = paramsNode.namedChild(i);
@@ -333,7 +337,10 @@ const findTsIterableElementType = (iterableName: string, startNode: SyntaxNode, 
  *   3. AST walk — walks up to the enclosing function's parameters to read User[] annotations directly
  * Only handles `for...of`; `for...in` produces string keys, not element types.
  */
-const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTypeNodes, scope, returnTypeLookup }): void => {
+const extractForLoopBinding: ForLoopExtractor = (
+  node,
+  { scopeEnv, declarationTypeNodes, scope, returnTypeLookup },
+): void => {
   if (node.type !== 'for_in_statement') return;
 
   // Confirm this is `for...of`, not `for...in`, by scanning unnamed children for the keyword text.
@@ -389,8 +396,13 @@ const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTy
     const containerTypeName = scopeEnv.get(iterableName!);
     const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
     elementType = resolveIterableElementType(
-      iterableName!, node, scopeEnv, declarationTypeNodes, scope,
-      extractTsElementTypeFromAnnotation, findTsIterableElementType,
+      iterableName!,
+      node,
+      scopeEnv,
+      declarationTypeNodes,
+      scope,
+      extractTsElementTypeFromAnnotation,
+      findTsIterableElementType,
       typeArgPos,
     );
   }
@@ -429,8 +441,40 @@ const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTy
   if (loopVarName) scopeEnv.set(loopVarName, elementType);
 };
 
+/** Collect fieldAccess items from an object_pattern's destructured properties. */
+const collectDestructuredFields = (
+  nameNode: SyntaxNode,
+  receiver: string,
+  scopeEnv: ReadonlyMap<string, string>,
+): PendingAssignment[] => {
+  const items: PendingAssignment[] = [];
+  for (let j = 0; j < nameNode.namedChildCount; j++) {
+    const prop = nameNode.namedChild(j);
+    if (!prop) continue;
+    if (prop.type === 'shorthand_property_identifier_pattern') {
+      // `const { name } = obj` → shorthand: varName = fieldName
+      const varName = prop.text;
+      if (!scopeEnv.has(varName)) {
+        items.push({ kind: 'fieldAccess', lhs: varName, receiver, field: varName });
+      }
+    } else if (prop.type === 'pair_pattern') {
+      // `const { address: addr } = obj` → pair_pattern: key=field, value=varName
+      const keyNode = prop.childForFieldName('key');
+      const valNode = prop.childForFieldName('value');
+      if (keyNode && valNode) {
+        const fieldName = keyNode.text;
+        const varName = valNode.text;
+        if (!scopeEnv.has(varName)) {
+          items.push({ kind: 'fieldAccess', lhs: varName, receiver, field: fieldName });
+        }
+      }
+    }
+  }
+  return items;
+};
+
 /** TS/JS: const alias = u → variable_declarator with name/value fields.
- *  Also handles destructuring: `const { a, b } = obj` → N fieldAccess items. */
+ *  Also handles destructuring: `const { a, b } = obj` and `const { a } = fn()` → N fieldAccess items. */
 const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) => {
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
@@ -439,34 +483,50 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
     const valueNode = child.childForFieldName('value');
     if (!nameNode || !valueNode) continue;
 
-    // Object destructuring: `const { address, name } = user`
-    // Emits N fieldAccess items — one per destructured binding.
+    // Object destructuring from identifier: `const { address, name } = user`
     if (nameNode.type === 'object_pattern' && valueNode.type === 'identifier') {
-      const receiver = valueNode.text;
-      const items: PendingAssignment[] = [];
-      for (let j = 0; j < nameNode.namedChildCount; j++) {
-        const prop = nameNode.namedChild(j);
-        if (!prop) continue;
-        if (prop.type === 'shorthand_property_identifier_pattern') {
-          // `const { name } = user` → shorthand: varName = fieldName
-          const varName = prop.text;
-          if (!scopeEnv.has(varName)) {
-            items.push({ kind: 'fieldAccess', lhs: varName, receiver, field: varName });
-          }
-        } else if (prop.type === 'pair_pattern') {
-          // `const { address: addr } = user` → pair_pattern: key=field, value=varName
-          const keyNode = prop.childForFieldName('key');
-          const valNode = prop.childForFieldName('value');
-          if (keyNode && valNode) {
-            const fieldName = keyNode.text;
-            const varName = valNode.text;
-            if (!scopeEnv.has(varName)) {
-              items.push({ kind: 'fieldAccess', lhs: varName, receiver, field: fieldName });
+      const items = collectDestructuredFields(nameNode, valueNode.text, scopeEnv);
+      if (items.length > 0) return items;
+      continue;
+    }
+
+    // Object destructuring from call/await: `const { x } = fn()` or `const { x } = await fn()`
+    // Emits a synthetic callResult + N fieldAccess items resolved via fixpoint iteration.
+    if (nameNode.type === 'object_pattern') {
+      const callNode = unwrapAwait(valueNode);
+      if (callNode?.type === 'call_expression') {
+        const funcNode = callNode.childForFieldName('function');
+        if (funcNode) {
+          let syntheticVar: string | undefined;
+          let leadItem: PendingAssignment | undefined;
+
+          if (funcNode.type === 'identifier') {
+            syntheticVar = `__destr_${funcNode.text}_${callNode.startIndex}`;
+            leadItem = { kind: 'callResult', lhs: syntheticVar, callee: funcNode.text };
+          } else if (funcNode.type === 'member_expression') {
+            const obj = funcNode.childForFieldName('object');
+            const prop = funcNode.childForFieldName('property');
+            if (
+              obj &&
+              prop?.type === 'property_identifier' &&
+              (obj.type === 'identifier' || obj.type === 'this')
+            ) {
+              syntheticVar = `__destr_${prop.text}_${callNode.startIndex}`;
+              leadItem = {
+                kind: 'methodCallResult',
+                lhs: syntheticVar,
+                receiver: obj.text,
+                method: prop.text,
+              };
             }
+          }
+
+          if (syntheticVar && leadItem) {
+            const fieldItems = collectDestructuredFields(nameNode, syntheticVar, scopeEnv);
+            if (fieldItems.length > 0) return [leadItem, ...fieldItems];
           }
         }
       }
-      if (items.length > 0) return items;
       continue;
     }
 
@@ -477,8 +537,11 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
     if (valueNode.type === 'member_expression') {
       const obj = valueNode.childForFieldName('object');
       const prop = valueNode.childForFieldName('property');
-      if (obj && prop?.type === 'property_identifier' &&
-          (obj.type === 'identifier' || obj.type === 'this')) {
+      if (
+        obj &&
+        prop?.type === 'property_identifier' &&
+        (obj.type === 'identifier' || obj.type === 'this')
+      ) {
         return { kind: 'fieldAccess', lhs, receiver: obj.text, field: prop.text };
       }
       continue;
@@ -496,8 +559,11 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
     if (funcNode.type === 'member_expression') {
       const obj = funcNode.childForFieldName('object');
       const prop = funcNode.childForFieldName('property');
-      if (obj && prop?.type === 'property_identifier' &&
-          (obj.type === 'identifier' || obj.type === 'this')) {
+      if (
+        obj &&
+        prop?.type === 'property_identifier' &&
+        (obj.type === 'identifier' || obj.type === 'this')
+      ) {
         return { kind: 'methodCallResult', lhs, receiver: obj.text, method: prop.text };
       }
     }
@@ -529,8 +595,13 @@ const findIfConsequenceBlock = (binaryExpr: SyntaxNode): SyntaxNode | undefined 
       return undefined;
     }
     // Stop climbing at function/block boundaries — don't cross scope
-    if (current.type === 'function_declaration' || current.type === 'function_expression'
-      || current.type === 'arrow_function' || current.type === 'method_definition') return undefined;
+    if (
+      current.type === 'function_declaration' ||
+      current.type === 'function_expression' ||
+      current.type === 'arrow_function' ||
+      current.type === 'method_definition'
+    )
+      return undefined;
     current = current.parent;
   }
   return undefined;
@@ -540,11 +611,16 @@ const findIfConsequenceBlock = (binaryExpr: SyntaxNode): SyntaxNode | undefined 
  *  Also handles null-check narrowing: `x !== null`, `x != undefined` etc.
  *  instanceof: first-writer-wins (no prior type binding).
  *  null-check: position-indexed narrowing via narrowingRange. */
-const extractPatternBinding: PatternBindingExtractor = (node, scopeEnv, declarationTypeNodes, scope) => {
+const extractPatternBinding: PatternBindingExtractor = (
+  node,
+  scopeEnv,
+  declarationTypeNodes,
+  scope,
+) => {
   if (node.type !== 'binary_expression') return undefined;
 
   // Check for instanceof first (existing behavior)
-  const instanceofOp = node.children.find(c => !c.isNamed && c.text === 'instanceof');
+  const instanceofOp = node.children.find((c) => !c.isNamed && c.text === 'instanceof');
   if (instanceofOp) {
     const left = node.namedChild(0);
     const right = node.namedChild(1);
@@ -553,7 +629,7 @@ const extractPatternBinding: PatternBindingExtractor = (node, scopeEnv, declarat
   }
 
   // Null-check narrowing: x !== null, x != null, x !== undefined, x != undefined
-  const op = node.children.find(c => !c.isNamed && (c.text === '!==' || c.text === '!='));
+  const op = node.children.find((c) => !c.isNamed && (c.text === '!==' || c.text === '!='));
   if (!op) return undefined;
 
   const left = node.namedChild(0);
@@ -627,7 +703,6 @@ export const typeConfig: LanguageTypeConfig = {
   extractParameter,
   extractInitializer,
   scanConstructorBinding,
-  extractReturnType,
   extractForLoopBinding,
   extractPendingAssignment,
   extractPatternBinding,

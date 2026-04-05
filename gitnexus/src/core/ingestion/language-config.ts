@@ -1,6 +1,6 @@
 import fs from 'fs/promises';
 import path from 'path';
-import type { ImportConfigs } from './import-resolution.js';
+import type { ImportConfigs } from './import-resolvers/types.js';
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -26,6 +26,9 @@ export interface GoModuleConfig {
 export interface ComposerConfig {
   /** Map of namespace prefix -> directory (e.g., "App\\" -> "app/") */
   psr4: Map<string, string>;
+  /** PSR-4 entries sorted by namespace length descending (longest match wins).
+   *  Cached once at config load time to avoid re-sorting on every import. */
+  psr4Sorted?: readonly [string, string][];
 }
 
 /** C# project config parsed from .csproj files */
@@ -157,7 +160,13 @@ export async function loadCSharpProjectConfig(repoRoot: string): Promise<CSharpP
       for (const entry of entries) {
         if (entry.isDirectory() && depth < maxDepth) {
           // Skip common non-project directories
-          if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === 'bin' || entry.name === 'obj') continue;
+          if (
+            entry.name === 'node_modules' ||
+            entry.name === '.git' ||
+            entry.name === 'bin' ||
+            entry.name === 'obj'
+          )
+            continue;
           scanQueue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
         }
         if (entry.isFile() && entry.name.endsWith('.csproj')) {
@@ -165,13 +174,13 @@ export async function loadCSharpProjectConfig(repoRoot: string): Promise<CSharpP
             const csprojPath = path.join(dir, entry.name);
             const content = await fs.readFile(csprojPath, 'utf-8');
             const nsMatch = content.match(/<RootNamespace>\s*([^<]+)\s*<\/RootNamespace>/);
-            const rootNamespace = nsMatch
-              ? nsMatch[1].trim()
-              : entry.name.replace(/\.csproj$/, '');
+            const rootNamespace = nsMatch ? nsMatch[1].trim() : entry.name.replace(/\.csproj$/, '');
             const projectDir = path.relative(repoRoot, dir).replace(/\\/g, '/');
             configs.push({ rootNamespace, projectDir });
             if (isDev) {
-              console.log(`📦 Loaded C# project: ${entry.name} (namespace: ${rootNamespace}, dir: ${projectDir})`);
+              console.log(
+                `📦 Loaded C# project: ${entry.name} (namespace: ${rootNamespace}, dir: ${projectDir})`,
+              );
             }
           } catch {
             // Can't read .csproj

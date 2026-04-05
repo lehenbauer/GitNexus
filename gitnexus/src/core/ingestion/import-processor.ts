@@ -2,33 +2,59 @@ import { KnowledgeGraph } from '../graph/types.js';
 import { ASTCache } from './ast-cache.js';
 import Parser from 'tree-sitter';
 import { isLanguageAvailable, loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
-import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
+import { getProvider, getProviderForFile, providersWithImplicitWiring } from './languages/index.js';
+import type { LanguageProvider } from './language-provider.js';
 import { generateId } from '../../lib/utils.js';
-import { getLanguageFromFilename, isVerboseIngestionEnabled, yieldToEventLoop } from './utils.js';
+import { getLanguageFromFilename } from 'gitnexus-shared';
+import { isVerboseIngestionEnabled } from './utils/verbose.js';
+import { yieldToEventLoop } from './utils/event-loop.js';
 import type { ExtractedImport } from './workers/parse-worker.js';
 import { getTreeSitterBufferSize } from './constants.js';
 import { loadImportConfigs } from './language-config.js';
-import { buildSuffixIndex } from './resolvers/index.js';
-import { callRouters } from './call-routing.js';
-import type { ResolutionContext } from './resolution-context.js';
-import type { SuffixIndex } from './resolvers/index.js';
-import { importResolvers, namedBindingExtractors, preprocessImportPath } from './import-resolution.js';
-import type { ImportResult, ResolveCtx, NamedBinding } from './import-resolution.js';
-
-// Re-export resolver types for consumers
-export type {
-  SuffixIndex,
-  TsconfigPaths,
-  GoModuleConfig,
-  CSharpProjectConfig,
-  ComposerConfig
-} from './resolvers/index.js';
+import { buildSuffixIndex } from './import-resolvers/utils.js';
+import type { ResolutionContext, ModuleAliasMap } from './resolution-context.js';
+import type {
+  ImportResult,
+  ResolveCtx,
+  ImportResolutionContext,
+} from './import-resolvers/types.js';
+import type { NamedBinding } from './named-bindings/types.js';
+import type { SyntaxNode } from './utils/ast-helpers.js';
 
 const isDev = process.env.NODE_ENV === 'development';
 
 // Type: Map<FilePath, Set<ResolvedFilePath>>
 // Stores all files that a given file imports from
 export type ImportMap = Map<string, Set<string>>;
+
+/** Group files by provider (only those with implicit import wiring), then call each wirer
+ *  with its own language's files. O(n) over files, O(1) per provider lookup. */
+function wireImplicitImports(
+  files: string[],
+  importMap: Map<string, Set<string>>,
+  addImportEdge: (src: string, target: string) => void,
+  projectConfig: unknown,
+): void {
+  if (providersWithImplicitWiring.length === 0) return;
+
+  const grouped = new Map<LanguageProvider, string[]>();
+  for (const file of files) {
+    const provider = getProviderForFile(file);
+    if (!provider?.implicitImportWirer) continue;
+    let list = grouped.get(provider);
+    if (!list) {
+      list = [];
+      grouped.set(provider, list);
+    }
+    list.push(file);
+  }
+
+  for (const [provider, langFiles] of grouped) {
+    if (langFiles.length > 1) {
+      provider.implicitImportWirer(langFiles, importMap, addImportEdge, projectConfig);
+    }
+  }
+}
 
 // Type: Map<FilePath, Set<PackageDirSuffix>>
 // Stores Go package directory suffixes imported by a file (e.g., "/internal/auth/").
@@ -41,7 +67,10 @@ export type PackageMap = Map<string, Set<string>>;
 // means only `User` (not `Repo`) is visible from models.ts via this import.
 // Stores both the resolved source path and the original exported name so that
 // aliased imports (`import { User as U }`) can resolve U → User in the source file.
-export interface NamedImportBinding { sourcePath: string; exportedName: string }
+export interface NamedImportBinding {
+  sourcePath: string;
+  exportedName: string;
+}
 export type NamedImportMap = Map<string, Map<string, NamedImportBinding>>;
 
 /**
@@ -56,25 +85,41 @@ export function isFileInPackageDir(filePath: string, dirSuffix: string): boolean
   return !afterDir.includes('/');
 }
 
-/** Pre-built lookup structures for import resolution. Build once, reuse across chunks. */
-export interface ImportResolutionContext {
-  allFilePaths: Set<string>;
-  allFileList: string[];
-  normalizedFileList: string[];
-  index: SuffixIndex;
-  resolveCache: Map<string, string | null>;
-}
+// ImportResolutionContext is defined in ./import-resolvers/types.ts — re-exported here for consumers.
 
 export function buildImportResolutionContext(allPaths: string[]): ImportResolutionContext {
   const allFileList = allPaths;
-  const normalizedFileList = allFileList.map(p => p.replace(/\\/g, '/'));
+  const normalizedFileList = allFileList.map((p) => p.replace(/\\/g, '/'));
   const allFilePaths = new Set(allFileList);
   const index = buildSuffixIndex(normalizedFileList, allFileList);
   return { allFilePaths, allFileList, normalizedFileList, index, resolveCache: new Map() };
 }
 
 // Config loaders extracted to ./language-config.ts (Phase 2 refactor)
-// Resolver dispatch tables are in ./import-resolution.ts — imported above
+// Resolver types are in ./import-resolvers/types.ts; named binding types in ./named-bindings/types.ts
+
+// ============================================================================
+// Import path preprocessing
+// ============================================================================
+
+/**
+ * Clean and preprocess a raw import source text into a resolved import path.
+ * Strips quotes/angle brackets (universal) and applies provider-specific
+ * transformations (currently only Kotlin wildcard import detection).
+ */
+export function preprocessImportPath(
+  sourceText: string,
+  importNode: SyntaxNode,
+  provider: LanguageProvider,
+): string | null {
+  const cleaned = sourceText.replace(/['"<>]/g, '');
+  // Defense-in-depth: reject null bytes and control characters (matches Ruby call-routing pattern)
+  if (!cleaned || cleaned.length > 2048 || /[\x00-\x1f]/.test(cleaned)) return null;
+  if (provider.importPathPreprocessor) {
+    return provider.importPathPreprocessor(cleaned, importNode);
+  }
+  return cleaned;
+}
 
 /** Create IMPORTS edge helpers that share a resolved-count tracker. */
 function createImportEdgeHelpers(graph: KnowledgeGraph, importMap: ImportMap) {
@@ -85,7 +130,14 @@ function createImportEdgeHelpers(graph: KnowledgeGraph, importMap: ImportMap) {
     const targetId = generateId('File', resolvedPath);
     const relId = generateId('IMPORTS', `${filePath}->${resolvedPath}`);
     totalImportsResolved++;
-    graph.addRelationship({ id: relId, sourceId, targetId, type: 'IMPORTS', confidence: 1.0, reason: '' });
+    graph.addRelationship({
+      id: relId,
+      sourceId,
+      targetId,
+      type: 'IMPORTS',
+      confidence: 1.0,
+      reason: '',
+    });
   };
 
   const addImportEdge = (filePath: string, resolvedPath: string) => {
@@ -101,6 +153,7 @@ function createImportEdgeHelpers(graph: KnowledgeGraph, importMap: ImportMap) {
  * Apply an ImportResult: emit graph edges and update ImportMap/PackageMap.
  * If namedBindings are provided and the import resolves to a single file,
  * also populate the NamedImportMap for precise Tier 2a resolution.
+ * Bindings tagged with `isModuleAlias` are routed to moduleAliasMap instead.
  */
 function applyImportResult(
   result: ImportResult,
@@ -111,6 +164,7 @@ function applyImportResult(
   addImportGraphEdge: (from: string, to: string) => void,
   namedBindings?: NamedBinding[],
   namedImportMap?: NamedImportMap,
+  moduleAliasMap?: ModuleAliasMap,
 ): void {
   if (!result) return;
 
@@ -128,6 +182,21 @@ function applyImportResult(
       addImportEdge(filePath, resolvedFile);
     }
 
+    // Route module aliases (import X as Y) directly to moduleAliasMap.
+    // These are module-level aliases, not symbol bindings — they don't belong in namedImportMap.
+    if (namedBindings && moduleAliasMap && files.length === 1) {
+      const resolvedFile = files[0];
+      for (const binding of namedBindings) {
+        if (!binding.isModuleAlias) continue;
+        let aliasMap = moduleAliasMap.get(filePath);
+        if (!aliasMap) {
+          aliasMap = new Map();
+          moduleAliasMap.set(filePath, aliasMap);
+        }
+        aliasMap.set(binding.local, resolvedFile);
+      }
+    }
+
     // Record named bindings for precise Tier 2a resolution.
     // If the same local name is imported from multiple files (e.g., Java static imports
     // of overloaded methods), remove the entry so resolution falls through to Tier 2a
@@ -139,11 +208,15 @@ function applyImportResult(
       if (files.length === 1) {
         const resolvedFile = files[0];
         for (const binding of namedBindings) {
+          if (binding.isModuleAlias) continue; // already routed to moduleAliasMap
           const existing = fileBindings.get(binding.local);
           if (existing && existing.sourcePath !== resolvedFile) {
             fileBindings.delete(binding.local);
           } else {
-            fileBindings.set(binding.local, { sourcePath: resolvedFile, exportedName: binding.exported });
+            fileBindings.set(binding.local, {
+              sourcePath: resolvedFile,
+              exportedName: binding.exported,
+            });
           }
         }
       } else {
@@ -151,8 +224,9 @@ function applyImportResult(
         // Match each binding to a resolved file by comparing the lowercase binding name
         // to the file's basename (without extension). If no match, skip the binding.
         for (const binding of namedBindings) {
+          if (binding.isModuleAlias) continue;
           const lowerName = binding.exported.toLowerCase();
-          const matchedFile = files.find(f => {
+          const matchedFile = files.find((f) => {
             const base = f.replace(/\\/g, '/').split('/').pop() ?? '';
             const nameWithoutExt = base.substring(0, base.lastIndexOf('.')).toLowerCase();
             return nameWithoutExt === lowerName;
@@ -162,7 +236,10 @@ function applyImportResult(
             if (existing && existing.sourcePath !== matchedFile) {
               fileBindings.delete(binding.local);
             } else {
-              fileBindings.set(binding.local, { sourcePath: matchedFile, exportedName: binding.exported });
+              fileBindings.set(binding.local, {
+                sourcePath: matchedFile,
+                exportedName: binding.exported,
+              });
             }
           }
         }
@@ -187,15 +264,16 @@ export const processImports = async (
   const importMap = ctx.importMap;
   const packageMap = ctx.packageMap;
   const namedImportMap = ctx.namedImportMap;
+  const moduleAliasMap = ctx.moduleAliasMap;
   // Use allPaths (full repo) when available for cross-chunk resolution, else fall back to chunk files
-  const allFileList = allPaths ?? files.map(f => f.path);
+  const allFileList = allPaths ?? files.map((f) => f.path);
   const allFilePaths = new Set(allFileList);
   const parser = await loadParser();
   const logSkipped = isVerboseIngestionEnabled();
   const skippedByLang = logSkipped ? new Map<string, number>() : null;
   const resolveCache = new Map<string, string | null>();
   // Pre-compute normalized file list once (forward slashes)
-  const normalizedFileList = allFileList.map(p => p.replace(/\\/g, '/'));
+  const normalizedFileList = allFileList.map((p) => p.replace(/\\/g, '/'));
   // Build suffix index for O(1) lookups
   const index = buildSuffixIndex(normalizedFileList, allFileList);
 
@@ -204,8 +282,18 @@ export const processImports = async (
 
   // Load language-specific configs once before the file loop
   const configs = await loadImportConfigs(repoRoot || '');
-  const resolveCtx: ResolveCtx = { allFilePaths, allFileList, normalizedFileList, index, resolveCache, configs };
-  const { addImportEdge, addImportGraphEdge, getResolvedCount } = createImportEdgeHelpers(graph, importMap);
+  const resolveCtx: ResolveCtx = {
+    allFilePaths,
+    allFileList,
+    normalizedFileList,
+    index,
+    resolveCache,
+    configs,
+  };
+  const { addImportEdge, addImportGraphEdge, getResolvedCount } = createImportEdgeHelpers(
+    graph,
+    importMap,
+  );
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
@@ -222,7 +310,8 @@ export const processImports = async (
       continue;
     }
 
-    const queryStr = LANGUAGE_QUERIES[language];
+    const provider = getProvider(language);
+    const queryStr = provider.treeSitterQueries;
     if (!queryStr) continue;
 
     // 2. ALWAYS load the language before querying (parser is stateful)
@@ -234,7 +323,9 @@ export const processImports = async (
 
     if (!tree) {
       try {
-        tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+        tree = parser.parse(file.content, undefined, {
+          bufferSize: getTreeSitterBufferSize(file.content.length),
+        });
       } catch (parseError) {
         continue;
       }
@@ -261,13 +352,13 @@ export const processImports = async (
         console.groupEnd();
       }
 
-      if (wasReparsed) (tree as any).delete?.();
+      if (wasReparsed) (tree as unknown as { delete?: () => void }).delete?.();
       continue;
     }
 
-    matches.forEach(match => {
+    matches.forEach((match) => {
       const captureMap: Record<string, any> = {};
-      match.captures.forEach(c => captureMap[c.name] = c.node);
+      match.captures.forEach((c) => (captureMap[c.name] = c.node));
 
       if (captureMap['import']) {
         const sourceNode = captureMap['import.source'];
@@ -278,26 +369,42 @@ export const processImports = async (
           return;
         }
 
-        const rawImportPath = preprocessImportPath(sourceNode.text, captureMap['import'], language);
+        const rawImportPath = preprocessImportPath(sourceNode.text, captureMap['import'], provider);
         if (!rawImportPath) return;
         totalImportsFound++;
 
-        const result = importResolvers[language](rawImportPath, file.path, resolveCtx);
-        const extractor = namedBindingExtractors[language];
+        const result = provider.importResolver(rawImportPath, file.path, resolveCtx);
+        const extractor = provider.namedBindingExtractor;
         const bindings = namedImportMap && extractor ? extractor(captureMap['import']) : undefined;
-        applyImportResult(result, file.path, importMap, packageMap, addImportEdge, addImportGraphEdge, bindings, namedImportMap);
+        applyImportResult(
+          result,
+          file.path,
+          importMap,
+          packageMap,
+          addImportEdge,
+          addImportGraphEdge,
+          bindings,
+          namedImportMap,
+          moduleAliasMap,
+        );
       }
 
       // ---- Language-specific call-as-import routing (Ruby require, etc.) ----
       if (captureMap['call']) {
         const callNameNode = captureMap['call.name'];
         if (callNameNode) {
-          const callRouter = callRouters[language];
-          const routed = callRouter(callNameNode.text, captureMap['call']);
+          const routed = provider.callRouter?.(callNameNode.text, captureMap['call']);
           if (routed && routed.kind === 'import') {
             totalImportsFound++;
-            const result = importResolvers[language](routed.importPath, file.path, resolveCtx);
-            applyImportResult(result, file.path, importMap, packageMap, addImportEdge, addImportGraphEdge);
+            const result = provider.importResolver(routed.importPath, file.path, resolveCtx);
+            applyImportResult(
+              result,
+              file.path,
+              importMap,
+              packageMap,
+              addImportEdge,
+              addImportGraphEdge,
+            );
           }
         }
       }
@@ -306,16 +413,20 @@ export const processImports = async (
     // Tree is now owned by the LRU cache — no manual delete needed
   }
 
+  wireImplicitImports(allFileList, importMap, addImportEdge, configs);
+
   if (skippedByLang && skippedByLang.size > 0) {
     for (const [lang, count] of skippedByLang.entries()) {
       console.warn(
-        `[ingestion] Skipped ${count} ${lang} file(s) in import processing — ${lang} parser not available.`
+        `[ingestion] Skipped ${count} ${lang} file(s) in import processing — ${lang} parser not available.`,
       );
     }
   }
 
   if (isDev) {
-    console.log(`📊 Import processing complete: ${getResolvedCount()}/${totalImportsFound} imports resolved to graph edges`);
+    console.log(
+      `📊 Import processing complete: ${getResolvedCount()}/${totalImportsFound} imports resolved to graph edges`,
+    );
   }
 };
 
@@ -335,14 +446,25 @@ export const processImportsFromExtracted = async (
   const importMap = ctx.importMap;
   const packageMap = ctx.packageMap;
   const namedImportMap = ctx.namedImportMap;
-  const importCtx = prebuiltCtx ?? buildImportResolutionContext(files.map(f => f.path));
+  const moduleAliasMap = ctx.moduleAliasMap;
+  const importCtx = prebuiltCtx ?? buildImportResolutionContext(files.map((f) => f.path));
   const { allFilePaths, allFileList, normalizedFileList, index, resolveCache } = importCtx;
 
   let totalImportsFound = 0;
 
   const configs = await loadImportConfigs(repoRoot || '');
-  const resolveCtx: ResolveCtx = { allFilePaths, allFileList, normalizedFileList, index, resolveCache, configs };
-  const { addImportEdge, addImportGraphEdge, getResolvedCount } = createImportEdgeHelpers(graph, importMap);
+  const resolveCtx: ResolveCtx = {
+    allFilePaths,
+    allFileList,
+    normalizedFileList,
+    index,
+    resolveCache,
+    configs,
+  };
+  const { addImportEdge, addImportGraphEdge, getResolvedCount } = createImportEdgeHelpers(
+    graph,
+    importMap,
+  );
 
   // Group by file for progress reporting (users see file count, not import count)
   const importsByFile = new Map<string, ExtractedImport[]>();
@@ -368,14 +490,34 @@ export const processImportsFromExtracted = async (
     for (const imp of fileImports) {
       totalImportsFound++;
 
-      const result = importResolvers[imp.language](imp.rawImportPath, filePath, resolveCtx);
-      applyImportResult(result, filePath, importMap, packageMap, addImportEdge, addImportGraphEdge, imp.namedBindings, namedImportMap);
+      const provider = getProvider(imp.language);
+      const result = provider.importResolver(imp.rawImportPath, filePath, resolveCtx);
+      applyImportResult(
+        result,
+        filePath,
+        importMap,
+        packageMap,
+        addImportEdge,
+        addImportGraphEdge,
+        imp.namedBindings,
+        namedImportMap,
+        moduleAliasMap,
+      );
     }
   }
 
   onProgress?.(totalFiles, totalFiles);
 
+  wireImplicitImports(
+    files.map((f) => f.path),
+    importMap,
+    addImportEdge,
+    configs,
+  );
+
   if (isDev) {
-    console.log(`📊 Import processing (fast path): ${getResolvedCount()}/${totalImportsFound} imports resolved to graph edges`);
+    console.log(
+      `📊 Import processing (fast path): ${getResolvedCount()}/${totalImportsFound} imports resolved to graph edges`,
+    );
   }
 };

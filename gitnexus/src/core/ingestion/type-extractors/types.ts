@@ -1,4 +1,4 @@
-import type { SyntaxNode } from '../utils.js';
+import type { SyntaxNode } from '../utils/ast-helpers.js';
 
 /** Extracts type bindings from a declaration node into the env map */
 export type TypeBindingExtractor = (node: SyntaxNode, env: Map<string, string>) => void;
@@ -6,23 +6,29 @@ export type TypeBindingExtractor = (node: SyntaxNode, env: Map<string, string>) 
 /** Extracts type bindings from a parameter node into the env map */
 export type ParameterExtractor = (node: SyntaxNode, env: Map<string, string>) => void;
 
+/** Optionally locates the type-annotation AST node for a declaration node.
+ * Used by buildTypeEnv to populate declarationTypeNodes and constructorTypeMap.
+ * If absent, buildTypeEnv falls back to generic heuristics (childForFieldName('type'), etc). */
+export type DeclarationTypeNodeLocator = (node: SyntaxNode) => SyntaxNode | null;
+
 /** Minimal interface for checking whether a name is a known class/struct.
  *  Narrower than ReadonlySet — only `.has()` is used by extractors. */
 export type ClassNameLookup = { has(name: string): boolean };
 
 /** Extracts type bindings from a constructor-call initializer, with access to known class names */
-export type InitializerExtractor = (node: SyntaxNode, env: Map<string, string>, classNames: ClassNameLookup) => void;
+export type InitializerExtractor = (
+  node: SyntaxNode,
+  env: Map<string, string>,
+  classNames: ClassNameLookup,
+) => void;
 
 /** Scans an AST node for untyped `var = callee()` patterns for return-type inference.
  *  Returns { varName, calleeName } if the node matches, undefined otherwise.
  *  `receiverClassName` — optional hint for method calls on known receivers
  *  (e.g. $this->getUser() in PHP provides the enclosing class name). */
-export type ConstructorBindingScanner = (node: SyntaxNode) => { varName: string; calleeName: string; receiverClassName?: string } | undefined;
-
-/** Extracts a return type string from a method/function definition node.
- *  Used for languages where return types are expressed in comments (e.g. YARD @return [Type])
- *  rather than in AST fields. Returns undefined if no return type can be determined. */
-export type ReturnTypeExtractor = (node: SyntaxNode) => string | undefined;
+export type ConstructorBindingScanner = (
+  node: SyntaxNode,
+) => { varName: string; calleeName: string; receiverClassName?: string } | undefined;
 
 /** Infer the type name of a literal AST node for overload disambiguation.
  *  Returns the canonical type name (e.g. 'int', 'String', 'boolean') or undefined
@@ -35,11 +41,17 @@ export type LiteralTypeInferrer = (node: SyntaxNode) => string | undefined;
  *  or undefined otherwise. Used for virtual dispatch in languages like Kotlin
  *  where constructors are syntactically identical to function calls, and C++
  *  where smart pointer factory functions (make_shared/make_unique) wrap constructors. */
-export type ConstructorTypeDetector = (node: SyntaxNode, classNames: ClassNameLookup) => string | undefined;
+export type ConstructorTypeDetector = (
+  node: SyntaxNode,
+  classNames: ClassNameLookup,
+) => string | undefined;
 
 /** Unwrap a declared type name to its inner type for virtual dispatch comparison.
  *  E.g., C++ shared_ptr<Animal> → Animal. Returns undefined if no unwrapping applies. */
-export type DeclaredTypeUnwrapper = (declaredType: string, typeNode: SyntaxNode) => string | undefined;
+export type DeclaredTypeUnwrapper = (
+  declaredType: string,
+  typeNode: SyntaxNode,
+) => string | undefined;
 
 /** Narrow lookup interface for resolving a callee name → return type name.
  *  Backed by SymbolTable.lookupFuzzyCallable; passed via ForLoopExtractorContext.
@@ -76,7 +88,7 @@ export type ForLoopExtractor = (node: SyntaxNode, ctx: ForLoopExtractorContext) 
  *  - `methodCallResult` — `const b = a.method()` (bind b to method's returnType on a's type) */
 export type PendingAssignment =
   | { kind: 'copy'; lhs: string; rhs: string }
-  | { kind: 'callResult'; lhs: string; callee: string }
+  | { kind: 'callResult'; lhs: string; callee: string; calleeFqn?: string; line?: number }
   | { kind: 'fieldAccess'; lhs: string; receiver: string; field: string }
   | { kind: 'methodCallResult'; lhs: string; receiver: string; method: string };
 
@@ -130,6 +142,9 @@ export interface LanguageTypeConfig {
   readonly allowPatternBindingOverwrite?: boolean;
   /** Node types that represent typed declarations for this language */
   declarationNodeTypes: ReadonlySet<string>;
+  /** Optional: language-specific way to find a declaration's type-annotation node.
+   * Prefer providing this for grammars where the type is wrapped (e.g., C#, Kotlin, Swift). */
+  getDeclarationTypeNode?: DeclarationTypeNodeLocator;
   /** AST node types for for-each/for-in statements with explicit element types. */
   forLoopNodeTypes?: ReadonlySet<string>;
   /** Optional allowlist of AST node types on which extractPatternBinding should run.
@@ -150,9 +165,6 @@ export interface LanguageTypeConfig {
    *  Called on every AST node during buildTypeEnv walk; returns undefined for non-matches.
    *  The callee binding is unverified — the caller must confirm against the SymbolTable. */
   scanConstructorBinding?: ConstructorBindingScanner;
-  /** Extract return type from comment-based annotations (e.g. YARD @return [Type]).
-   *  Called as fallback when extractMethodSignature finds no AST-based return type. */
-  extractReturnType?: ReturnTypeExtractor;
   /** Extract loop variable → type binding from a for-each AST node. */
   extractForLoopBinding?: ForLoopExtractor;
   /** Extract pending assignment for Tier 2 propagation.

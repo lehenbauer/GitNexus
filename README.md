@@ -19,6 +19,8 @@
     <img src="https://img.shields.io/badge/License-PolyForm%20Noncommercial-blue.svg" alt="License: PolyForm Noncommercial"/>
   </a>
 
+  <p><strong>Enterprise (SaaS & Self-hosted)</strong> - <a href="https://akonlabs.com">akonlabs.com</a></p>
+
 </div>
 
 **Building nervous system for agent context.**
@@ -58,6 +60,36 @@ https://github.com/user-attachments/assets/172685ba-8e54-4ea7-9ad1-e31a3398da72
 > **Bridge mode:** `gitnexus serve` connects the two — the web UI auto-detects the local server and can browse all your CLI-indexed repos without re-uploading or re-indexing.
 
 ---
+
+## Enterprise
+
+GitNexus is available as an **enterprise offering** - either as a fully managed **SaaS** or a **self-hosted** deployment. Also available for **commercial use** of the OSS version with proper licensing.
+
+Enterprise includes:
+- **PR Review** - automated blast radius analysis on pull requests
+- **Auto-updating Code Wiki** - always up-to-date documentation (Code Wiki is also available in OSS)
+- **Auto-reindexing** - knowledge graph stays fresh automatically
+- **Multi-repo support** - unified graph across repositories
+- **OCaml support** - additional language coverage
+- **Priority feature/language support** - request new languages or features
+
+**Upcoming:**
+- Auto regression forensics
+- End-to-end test generation
+
+👉 Learn more at [akonlabs.com](https://akonlabs.com)
+
+💬 For commercial licensing or enterprise inquiries, ping us on [Discord](https://discord.gg/AAsRVT6fGb) or drop an email at founders@akonlabs.com
+
+---
+
+## Development
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — packages, index → graph → MCP flow, where to change code
+- [RUNBOOK.md](RUNBOOK.md) — analyze, embeddings, stale index, MCP recovery, CI snippets
+- [GUARDRAILS.md](GUARDRAILS.md) — safety rules and operational “Signs” for contributors and agents
+- [CONTRIBUTING.md](CONTRIBUTING.md) — license, setup, commits, and pull requests
+- [TESTING.md](TESTING.md) — test commands for `gitnexus` and `gitnexus-web`
 
 ## CLI + MCP (recommended)
 
@@ -107,7 +139,11 @@ If you prefer manual configuration:
 **Claude Code** (full support — MCP + skills + hooks):
 
 ```bash
+# macOS / Linux
 claude mcp add gitnexus -- npx -y gitnexus@latest mcp
+
+# Windows
+claude mcp add gitnexus -- cmd /c npx -y gitnexus@latest mcp
 ```
 
 **Codex** (full support — MCP + skills):
@@ -135,8 +171,8 @@ codex mcp add gitnexus -- npx -y gitnexus@latest mcp
 {
   "mcp": {
     "gitnexus": {
-      "command": "npx",
-      "args": ["-y", "gitnexus@latest", "mcp"]
+      "type": "local",
+      "command": ["gitnexus", "mcp"]
     }
   }
 }
@@ -153,13 +189,14 @@ args = ["-y", "gitnexus@latest", "mcp"]
 ### CLI Commands
 
 ```bash
-gitnexus setup                    # Configure MCP for your editors (one-time)
-gitnexus analyze [path]           # Index a repository (or update stale index)
-gitnexus analyze --force          # Force full re-index
-gitnexus analyze --skills         # Generate repo-specific skill files from detected communities
+gitnexus setup                   # Configure MCP for your editors (one-time)
+gitnexus analyze [path]          # Index a repository (or update stale index)
+gitnexus analyze --force         # Force full re-index
+gitnexus analyze --skills        # Generate repo-specific skill files from detected communities
 gitnexus analyze --skip-embeddings  # Skip embedding generation (faster)
-gitnexus analyze --embeddings     # Enable embedding generation (slower, better search)
-gitnexus analyze --verbose        # Log skipped files when parsers are unavailable
+gitnexus analyze --skip-agents-md  # Preserve custom AGENTS.md/CLAUDE.md gitnexus section edits
+gitnexus analyze --embeddings    # Enable embedding generation (slower, better search)
+gitnexus analyze --verbose       # Log skipped files when parsers are unavailable
 gitnexus mcp                     # Start MCP server (stdio) — serves all indexed repos
 gitnexus serve                   # Start local HTTP server (multi-repo) for web UI connection
 gitnexus list                    # List all indexed repositories
@@ -169,11 +206,21 @@ gitnexus clean --all --force     # Delete all indexes
 gitnexus wiki [path]             # Generate repository wiki from knowledge graph
 gitnexus wiki --model <model>    # Wiki with custom LLM model (default: gpt-4o-mini)
 gitnexus wiki --base-url <url>   # Wiki with custom LLM API base URL
+
+# Repository groups (multi-repo / monorepo service tracking)
+gitnexus group create <name>     # Create a repository group
+gitnexus group add <name> <repo> # Add a repo to a group
+gitnexus group remove <name> <repo> # Remove a repo from a group
+gitnexus group list [name]       # List groups, or show one group's config
+gitnexus group sync <name>       # Extract contracts and match across repos/services
+gitnexus group contracts <name>  # Inspect extracted contracts and cross-links
+gitnexus group query <name> <q>  # Search execution flows across all repos in a group
+gitnexus group status <name>     # Check staleness of repos in a group
 ```
 
 ### What Your AI Agent Gets
 
-**7 tools** exposed via MCP:
+**16 tools** exposed via MCP (11 per-repo + 5 group):
 
 | Tool               | What It Does                                                      | `repo` Param |
 | ------------------ | ----------------------------------------------------------------- | -------------- |
@@ -184,6 +231,11 @@ gitnexus wiki --base-url <url>   # Wiki with custom LLM API base URL
 | `detect_changes` | Git-diff impact — maps changed lines to affected processes       | Optional       |
 | `rename`         | Multi-file coordinated rename with graph + text search            | Optional       |
 | `cypher`         | Raw Cypher graph queries                                          | Optional       |
+| `group_list`     | List configured repository groups                                 | —             |
+| `group_sync`     | Extract contracts and match across repos/services                 | —             |
+| `group_contracts`| Inspect extracted contracts and cross-links                       | —             |
+| `group_query`    | Search execution flows across all repos in a group                | —             |
+| `group_status`   | Check staleness of repos in a group                               | —             |
 
 > When only one repo is indexed, the `repo` parameter is optional. With multiple repos, specify which one: `query({query: "auth", repo: "my-app"})`.
 
@@ -279,8 +331,8 @@ Or run locally:
 
 ```bash
 git clone https://github.com/abhigyanpatwari/gitnexus.git
-cd gitnexus/gitnexus-web
-npm install
+cd gitnexus/gitnexus-shared && npm install && npm run build
+cd ../gitnexus-web && npm install
 npm run dev
 ```
 
@@ -363,6 +415,7 @@ GitNexus builds a complete knowledge graph of your codebase through a multi-phas
 | Swift | — | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | C | — | — | ✓ | — | ✓ | ✓ | — | ✓ | ✓ |
 | C++ | — | — | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ |
+| Dart | ✓ | — | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ |
 
 **Imports** — cross-file import resolution · **Named Bindings** — `import { X as Y }` / re-export tracking · **Exports** — public/exported symbol detection · **Heritage** — class inheritance, interfaces, mixins · **Type Annotations** — explicit type extraction for receiver resolution · **Constructor Inference** — infer receiver type from constructor calls (`self`/`this` resolution included for all languages) · **Config** — language toolchain config parsing (tsconfig, go.mod, etc.) · **Frameworks** — AST-based framework pattern detection · **Entry Points** — entry point scoring heuristics
 
@@ -527,7 +580,7 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 - [X] Constructor-Inferred Type Resolution, `self`/`this` Receiver Mapping
 - [X] Wiki Generation, Multi-File Rename, Git-Diff Impact Analysis
 - [X] Process-Grouped Search, 360-Degree Context, Claude Code Hooks
-- [X] Multi-Repo MCP, Zero-Config Setup, 13 Language Support
+- [X] Multi-Repo MCP, Zero-Config Setup, 14 Language Support
 - [X] Community Detection, Process Detection, Confidence Scoring
 - [X] Hybrid Search, Vector Index
 
