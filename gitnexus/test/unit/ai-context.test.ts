@@ -74,7 +74,7 @@ describe('generateAIContextFiles', () => {
     }
   });
 
-  it('preserves volatile counts when noStats is not set (default)', async () => {
+  it('always omits volatile counts (fork: counts never written)', async () => {
     const subDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-with-stats-test-'));
     const subStorage = path.join(subDir, '.gitnexus');
     await fs.mkdir(subStorage, { recursive: true });
@@ -84,9 +84,11 @@ describe('generateAIContextFiles', () => {
       for (const f of ['CLAUDE.md', 'AGENTS.md']) {
         const content = await fs.readFile(path.join(subDir, f), 'utf-8');
         expect(content).toContain('WithStatsProject');
-        expect(content).toMatch(
-          /\(12345\s+symbols,\s+67890\s+relationships,\s+99\s+execution flows\)/,
+        expect(content).not.toMatch(
+          /\(\d+\s+symbols,\s+\d+\s+relationships,\s+\d+\s+execution flows\)/,
         );
+        expect(content).not.toContain('12345');
+        expect(content).not.toContain('67890');
       }
     } finally {
       await fs.rm(subDir, { recursive: true, force: true });
@@ -194,16 +196,16 @@ Resources: gitnexus://repo/TestProject/context
 `;
     await fs.writeFile(claudeMdPath, customContent, 'utf-8');
 
-    // Run analyze with new stats — should only update the stats line
+    // Run analyze with new stats — the stats line refreshes the project name
+    // but never emits the volatile counts (fork behavior).
     const stats = { nodes: 999, edges: 1234, processes: 42 };
     await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats);
 
     const result = await fs.readFile(claudeMdPath, 'utf-8');
 
-    // Stats should be updated
-    expect(result).toContain('999 symbols');
-    expect(result).toContain('1234 relationships');
-    expect(result).toContain('42 execution flows');
+    // Stats line preserved with no counts; suffix prose stays intact
+    expect(result).toContain('Indexed as **TestProject**');
+    expect(result).not.toMatch(/\(\d+\s+symbols,/);
     expect(result).toContain('. MCP tools.');
 
     // Custom layout should be preserved (not replaced with verbose template)
@@ -552,10 +554,9 @@ Use 'query' for finding flows, 'context' for symbol details.
       await generateAIContextFiles(dir, path.join(dir, '.gitnexus'), 'AgentsTest', stats);
 
       const result = await fs.readFile(agentsPath, 'utf-8');
-      // Stats updated
-      expect(result).toContain('777 symbols');
-      expect(result).toContain('888 relationships');
-      expect(result).toContain('9 execution flows');
+      // Counts stripped on rewrite (fork behavior)
+      expect(result).toContain('Indexed as **AgentsTest**');
+      expect(result).not.toMatch(/\(\d+\s+symbols,/);
       // Custom layout preserved
       expect(result).toContain('# GitNexus context for AGENTS');
       expect(result).toContain("Use 'query' for finding flows");
@@ -614,9 +615,9 @@ Indexed as **Idem** (1 symbols, 2 relationships, 3 execution flows). Custom.
       await generateAIContextFiles(dir, path.join(dir, '.gitnexus'), 'CRLFTest', stats);
 
       const result = await fs.readFile(claudePath, 'utf-8');
-      // Stats updated correctly
-      expect(result).toContain('50 symbols');
-      expect(result).toContain('60 relationships');
+      // Counts stripped on rewrite (fork behavior)
+      expect(result).toContain('Indexed as **CRLFTest**');
+      expect(result).not.toMatch(/\(\d+\s+symbols,/);
       // Custom prose preserved
       expect(result).toContain('Custom CRLF');
       // No verbose template injected
@@ -709,31 +710,26 @@ Indexed as **OldName**. Custom.
     }
   });
 
-  it('noStats + keep marker: counts return when --no-stats is dropped after a count-free run (#1706)', async () => {
-    // --no-stats must not be sticky: once a prior run has left the
-    // keep-section line count-free, a later run WITHOUT --no-stats must
-    // restore the parenthetical. The optional parenthetical in statsPattern
-    // is what keeps the count-free line re-matchable.
+  it('keep marker: counts stay stripped regardless of CLI flags (fork)', async () => {
+    // In the upstream behavior, omitting --no-stats restored the parenthetical
+    // counts. In this fork the counts are never emitted: the line is rewritten
+    // count-free on every analyze so committed files never churn.
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-keep-counts-return-'));
     try {
       const claudePath = path.join(dir, 'CLAUDE.md');
-      // Seed already in the count-free shape a prior --no-stats run produces.
       const seed = `<!-- gitnexus:start -->
 <!-- gitnexus:keep -->
-Indexed as **FreezeTest**. Custom.
+Indexed as **FreezeTest** (1 symbols, 2 relationships, 3 execution flows). Custom.
 <!-- gitnexus:end -->
 `;
       await fs.writeFile(claudePath, seed, 'utf-8');
 
       const stats = { nodes: 11, edges: 22, processes: 3 };
-      // No noStats option — the counts must come back.
       await generateAIContextFiles(dir, path.join(dir, '.gitnexus'), 'FreezeTest', stats);
 
       const result = await fs.readFile(claudePath, 'utf-8');
-      expect(result).toContain(
-        'Indexed as **FreezeTest** (11 symbols, 22 relationships, 3 execution flows)',
-      );
-      // Suffix prose after the stats line is preserved.
+      expect(result).toContain('Indexed as **FreezeTest**');
+      expect(result).not.toMatch(/\(\d+\s+symbols,/);
       expect(result).toContain('Custom.');
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
@@ -796,8 +792,10 @@ Indexed as **placeholder** (1 symbols, 1 relationships, 1 execution flows). Cust
       await generateAIContextFiles(dir, path.join(dir, '.gitnexus'), trickyName, stats);
 
       const result = await fs.readFile(claudePath, 'utf-8');
-      // The full name appears in the bold of the stats line, intact
-      expect(result).toContain(`Indexed as **${trickyName}** (5 symbols`);
+      // The full name appears in the bold of the stats line, intact;
+      // counts are stripped (fork behavior).
+      expect(result).toContain(`Indexed as **${trickyName}**`);
+      expect(result).not.toMatch(/\(\d+\s+symbols,/);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }

@@ -131,7 +131,7 @@ ${tableBody}`
   return `${GITNEXUS_START_MARKER}
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **${projectName}**${noStats ? '' : ` (${stats.nodes || 0} symbols, ${stats.edges || 0} relationships, ${stats.processes || 0} execution flows)`}. Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **${projectName}**. Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run \`npx gitnexus analyze\` in terminal first.
 
@@ -240,22 +240,11 @@ async function upsertGitNexusSection(
     // between valid section markers identified by findSectionMarkerIndex), so
     // a keep marker in user prose OUTSIDE the GitNexus block has no effect.
     if (existingSection.includes('<!-- gitnexus:keep -->')) {
-      // Build the new stats line from the caller-provided values directly.
-      // We do NOT re-extract from `content` because:
-      //   (a) first-bold extraction is fragile if the template evolves
-      //   (b) the parenthesized-text fallback can match unrelated tuples
-      //       like `({target: "symbolName", direction: "upstream"})`
-      //       when noStats is set
-      // Passing projectName + stats explicitly makes the contract obvious.
-      // --no-stats wins in the keep path too (#1706): a lean block committed
-      // to git would otherwise churn the volatile counts on every analyze,
-      // producing no-value merge conflicts between branches. Under noStats we
-      // drop the parenthetical but still refresh the project name so renames
-      // propagate.
-      const newStatsInner = `${stats.nodes || 0} symbols, ${stats.edges || 0} relationships, ${stats.processes || 0} execution flows`;
-      const statsLine = noStats
-        ? `Indexed as **${projectName}**`
-        : `Indexed as **${projectName}** (${newStatsInner})`;
+      // Volatile counts are never emitted: they churn commits without adding
+      // value (a stale count is still wrong). The project name still refreshes
+      // so renames propagate. The optional parenthetical in statsPattern below
+      // lets us pick up any legacy line that still carries counts.
+      const statsLine = `Indexed as **${projectName}**`;
 
       // Match either canonical phrasing at line start (`^` with `m` flag) so we
       // cannot replace prose embedded mid-paragraph. Deliberately no `$`: text
