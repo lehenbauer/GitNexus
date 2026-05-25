@@ -1,5 +1,11 @@
 # GitNexus
 
+> **Fork notice — this is standard GitNexus except:**
+> - **Quieter commits.** Volatile index counts (symbol/edge totals) no longer get rewritten into `AGENTS.md`/`CLAUDE.md` on every analyze, so the AI-context files stop polluting unrelated diffs.
+> - **Lighter agent instructions.** The injected "Always Do / Never Do" block has been toned down: impact analysis is scoped to load-bearing edits (with an explicit carve-out for cosmetic work like copy, styling, and layout), and the per-commit `detect_changes` mandate is gone. The goal is to trade a bit of ceremony for noticeably faster development on small changes, while keeping the high-value tools (`gitnexus_query`, `gitnexus_context`, `gitnexus_impact` on risky edits, `gitnexus_rename`) prominent.
+>
+> Everything below is upstream documentation and applies unchanged.
+
 **⚠️ Important Notice:** GitNexus has NO official cryptocurrency, token, or coin. Any token/coin using the GitNexus name on Pump.fun or any other platform is **not affiliated with, endorsed by, or created by** this project or its maintainers. Do not purchase any cryptocurrency claiming association with GitNexus.
 
 <div align="center">
