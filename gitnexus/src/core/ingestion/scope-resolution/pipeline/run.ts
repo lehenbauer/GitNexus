@@ -44,6 +44,7 @@ import { emitImportEdges } from '../graph-bridge/imports-to-edges.js';
 import type { ScopeResolver } from '../contract/scope-resolver.js';
 import { findClassBindingInScope, findEnclosingClassDef } from '../scope/walkers.js';
 import { buildWorkspaceResolutionIndex } from '../workspace-index.js';
+import type { ResolutionOutcome, ResolutionOutcomeRecorder } from '../resolution-outcome.js';
 
 import { logger } from '../../../logger.js';
 
@@ -115,6 +116,12 @@ function preEmitInheritanceEdges(
   return handledSites;
 }
 
+export type ScopeResolutionSubPhase =
+  | 'extracting'
+  | 'analyzing types'
+  | 'resolving references'
+  | 'linking symbols';
+
 interface RunScopeResolutionInput {
   readonly graph: KnowledgeGraph;
   /**
@@ -161,6 +168,21 @@ interface RunScopeResolutionInput {
    * Cache miss is safe — falls back to fresh extract.
    */
   readonly preExtractedParsedFiles?: ReadonlyMap<string, ParsedFile>;
+  /**
+   * Optional additive diagnostics sink. Resolver passes call this when they
+   * intentionally suppress an edge; the graph remains unchanged.
+   */
+  readonly recordResolutionOutcome?: ResolutionOutcomeRecorder;
+  /**
+   * Optional progress callback for UI updates during long-running scope
+   * resolution. Called periodically during the extract loop and at each
+   * sub-phase boundary (finalize, resolve, emit).
+   *
+   * @param subPhase  Current sub-phase name for display
+   * @param current   Files processed so far (during extract) or total files (at phase boundaries)
+   * @param total     Total files in this language
+   */
+  readonly onProgress?: (subPhase: ScopeResolutionSubPhase, current: number, total: number) => void;
 }
 
 interface RunScopeResolutionStats {
@@ -170,6 +192,7 @@ interface RunScopeResolutionStats {
   readonly resolve: ResolveStats;
   readonly referenceEdgesEmitted: number;
   readonly referenceSkipped: number;
+  readonly resolutionOutcomes: readonly ResolutionOutcome[];
 }
 
 export function runScopeResolution(
@@ -178,6 +201,11 @@ export function runScopeResolution(
 ): RunScopeResolutionStats {
   const { graph, files } = input;
   const onWarn = input.onWarn ?? (() => {});
+  const resolutionOutcomes: ResolutionOutcome[] = [];
+  const recordResolutionOutcome: ResolutionOutcomeRecorder = (outcome) => {
+    resolutionOutcomes.push(outcome);
+    input.recordResolutionOutcome?.(outcome);
+  };
   const PROF = process.env.PROF_SCOPE_RESOLUTION === '1';
   const tStart = PROF ? process.hrtime.bigint() : 0n;
   let fileContents: Map<string, string> | undefined;
@@ -195,7 +223,10 @@ export function runScopeResolution(
   const treeCache = input.treeCache;
   const preExtracted = input.preExtractedParsedFiles;
   let preExtractedHits = 0;
-  for (const file of files) {
+  const progressInterval = files.length > 0 ? Math.max(1, Math.floor(files.length / 50)) : 1;
+  input.onProgress?.('extracting', 0, files.length);
+  for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
+    const file = files[fileIdx];
     let parsed: ParsedFile | undefined;
     // Fast path: a worker (during the parse phase) already produced a
     // ParsedFile for this file via `extractParsedFile`. Reuse it
@@ -220,6 +251,12 @@ export function runScopeResolution(
     }
     provider.populateOwners(parsed);
     parsedFiles.push(parsed);
+    if (
+      input.onProgress &&
+      ((fileIdx + 1) % progressInterval === 0 || fileIdx === files.length - 1)
+    ) {
+      input.onProgress('extracting', fileIdx + 1, files.length);
+    }
   }
   if (PROF && preExtracted !== undefined) {
     logger.warn(`[scope-resolution prof] pre-extracted hits: ${preExtractedHits}/${files.length}`);
@@ -248,12 +285,14 @@ export function runScopeResolution(
       resolve: { sitesProcessed: 0, referencesEmitted: 0, unresolved: 0 },
       referenceEdgesEmitted: 0,
       referenceSkipped: 0,
+      resolutionOutcomes,
     };
   }
 
   const tExtract = PROF ? process.hrtime.bigint() : 0n;
 
   // ── Phase 2: finalize → ScopeResolutionIndexes ─────────────────────────
+  input.onProgress?.('analyzing types', files.length, files.length);
   const allFilePaths = new Set(parsedFiles.map((f) => f.filePath));
   const nodeLookup = buildGraphNodeLookup(graph);
 
@@ -337,6 +376,7 @@ export function runScopeResolution(
   validateBindingsImmutability(indexes, onWarn);
 
   // ── Phase 3: resolve references via Registry.lookup ────────────────────
+  input.onProgress?.('resolving references', files.length, files.length);
   const registryProviders: RegistryProviders = {
     arityCompatibility: provider.arityCompatibility,
   };
@@ -349,6 +389,7 @@ export function runScopeResolution(
   const tResolve = PROF ? process.hrtime.bigint() : 0n;
 
   // ── Phase 4: emit graph edges (LOAD-BEARING ORDER — see I1) ────────────
+  input.onProgress?.('linking symbols', files.length, files.length);
   const handledSites = new Set<string>(preEmittedInheritanceSites);
   const receiverExtras = emitReceiverBoundCalls(
     graph,
@@ -359,6 +400,9 @@ export function runScopeResolution(
     provider,
     workspaceIndex,
     readonlyModel,
+    {
+      recordResolutionOutcome,
+    },
   );
   const unresolvedReceiverExtras =
     provider.emitUnresolvedReceiverEdges !== undefined
@@ -387,6 +431,7 @@ export function runScopeResolution(
       resolveAdlCandidates: provider.resolveAdlCandidates,
       conversionRankFn: provider.conversionRankFn,
       constraintCompatibility: provider.constraintCompatibility,
+      recordResolutionOutcome,
     },
   );
   const { emitted, skipped } = emitReferencesViaLookup(
@@ -424,5 +469,6 @@ export function runScopeResolution(
     resolve: resolveStats,
     referenceEdgesEmitted: emitted + receiverExtras + unresolvedReceiverExtras + freeCallExtras,
     referenceSkipped: skipped,
+    resolutionOutcomes,
   };
 }

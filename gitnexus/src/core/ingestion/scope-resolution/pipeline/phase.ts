@@ -34,9 +34,10 @@ import type { ParseOutput } from '../../pipeline-phases/parse.js';
 import { isRegistryPrimary } from '../../registry-primary-flag.js';
 import { SupportedLanguages, getLanguageFromFilename } from 'gitnexus-shared';
 import { readFileContents } from '../../filesystem-walker.js';
-import { runScopeResolution } from './run.js';
+import { runScopeResolution, type ScopeResolutionSubPhase } from './run.js';
 import { SCOPE_RESOLVERS } from './registry.js';
 import { isDev, isSemanticModelValidatorEnabled } from '../../utils/env.js';
+import type { ResolutionOutcome } from '../resolution-outcome.js';
 
 import { logger } from '../../../logger.js';
 export interface ScopeResolutionOutput {
@@ -48,6 +49,8 @@ export interface ScopeResolutionOutput {
   readonly importsEmitted: number;
   /** Reference (CALLS / ACCESSES / INHERITS / USES) edges emitted. */
   readonly referenceEdgesEmitted: number;
+  /** Additive stream of resolver diagnostics; does not affect graph edges. */
+  readonly resolutionOutcomes: readonly ResolutionOutcome[];
   /** Per-language breakdown for telemetry / shadow-parity. */
   readonly perLanguage: ReadonlyMap<
     SupportedLanguages,
@@ -64,6 +67,7 @@ const NOOP_OUTPUT: ScopeResolutionOutput = Object.freeze({
   filesProcessed: 0,
   importsEmitted: 0,
   referenceEdgesEmitted: 0,
+  resolutionOutcomes: [],
   perLanguage: new Map(),
 });
 
@@ -116,6 +120,7 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
     let totalImports = 0;
     let totalRefs = 0;
     let anyRan = false;
+    const resolutionOutcomes: ResolutionOutcome[] = [];
     const perLanguage = new Map<
       SupportedLanguages,
       {
@@ -124,6 +129,31 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
         readonly referenceEdgesEmitted: number;
       }
     >();
+
+    // Pre-count files and languages for progress reporting. This avoids
+    // a frozen progress bar during long scope-resolution runs (#1741).
+    let totalScopeFiles = 0;
+    let totalScopeLangs = 0;
+    for (const [lang] of SCOPE_RESOLVERS) {
+      if (!isRegistryPrimary(lang)) continue;
+      const count = scannedFiles.filter((f) => getLanguageFromFilename(f.path) === lang).length;
+      if (count > 0) {
+        totalScopeLangs++;
+        totalScopeFiles += count;
+      }
+    }
+    const SCOPE_PCT_START = 90;
+    const SCOPE_PCT_RANGE = 8; // 90-98 internal → 54-59% display
+    let processedScopeFiles = 0;
+    let currentLangIdx = 0;
+
+    if (totalScopeFiles > 0) {
+      ctx.onProgress({
+        phase: 'scopeResolution',
+        percent: SCOPE_PCT_START,
+        message: 'Resolving types',
+      });
+    }
 
     for (const [lang, provider] of SCOPE_RESOLVERS) {
       if (!isRegistryPrimary(lang)) continue;
@@ -148,6 +178,23 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
           ? await provider.loadResolutionConfig(ctx.repoPath)
           : undefined;
 
+      const langFileCount = files.length;
+      const langLabel = lang.charAt(0).toUpperCase() + lang.slice(1);
+      currentLangIdx++;
+      const langTag =
+        totalScopeLangs > 1 ? `${langLabel} [${currentLangIdx}/${totalScopeLangs}]` : langLabel;
+
+      if (totalScopeFiles > 0) {
+        const pct =
+          SCOPE_PCT_START + Math.round((processedScopeFiles / totalScopeFiles) * SCOPE_PCT_RANGE);
+        ctx.onProgress({
+          phase: 'scopeResolution',
+          percent: pct,
+          message: 'Resolving types',
+          detail: `${langTag}, ${langFileCount.toLocaleString()} files`,
+        });
+      }
+
       const stats = runScopeResolution(
         {
           graph: ctx.graph,
@@ -156,15 +203,67 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
           treeCache: scopeTreeCache,
           resolutionConfig,
           preExtractedParsedFiles: preExtractedByPath,
+          recordResolutionOutcome: (outcome) => {
+            resolutionOutcomes.push(outcome);
+          },
           onWarn: (msg) => {
             if (isSemanticModelValidatorEnabled()) {
               logger.warn(`[scope-resolution:${lang}] ${msg}`);
             }
           },
+          onProgress:
+            totalScopeFiles > 0
+              ? (subPhase: ScopeResolutionSubPhase, current, total) => {
+                  let langRatio: number;
+                  switch (subPhase) {
+                    case 'extracting':
+                      langRatio = total > 0 ? (current / total) * 0.5 : 0;
+                      break;
+                    case 'analyzing types':
+                      langRatio = 0.5;
+                      break;
+                    case 'resolving references':
+                      langRatio = 0.7;
+                      break;
+                    case 'linking symbols':
+                      langRatio = 0.85;
+                      break;
+                    default: {
+                      const _exhaustive: never = subPhase;
+                      langRatio = 0.85;
+                    }
+                  }
+                  const overallRatio = Math.min(
+                    1,
+                    (processedScopeFiles + langRatio * langFileCount) / totalScopeFiles,
+                  );
+                  const pct = SCOPE_PCT_START + Math.round(overallRatio * SCOPE_PCT_RANGE);
+                  ctx.onProgress({
+                    phase: 'scopeResolution',
+                    percent: pct,
+                    message: 'Resolving types',
+                    detail:
+                      subPhase === 'extracting'
+                        ? `${langTag} — extracting ${current.toLocaleString()}/${total.toLocaleString()} files`
+                        : `${langTag} — ${subPhase}`,
+                  });
+                }
+              : undefined,
         },
         provider,
       );
 
+      // Release file contents and pre-extracted entries after each language
+      // to reduce memory pressure. For large codebases (16K+ PHP files),
+      // holding all source code simultaneously with scope trees causes OOM.
+      // See: https://github.com/abhigyanpatwari/GitNexus/issues/1741
+      files.length = 0;
+      contents.clear();
+      for (const fp of filePaths) {
+        preExtractedByPath.delete(fp);
+      }
+
+      processedScopeFiles += langFileCount;
       anyRan = true;
       totalFiles += stats.filesProcessed;
       totalImports += stats.importsEmitted;
@@ -182,6 +281,15 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
       }
     }
 
+    if (totalScopeFiles > 0 && anyRan) {
+      ctx.onProgress({
+        phase: 'scopeResolution',
+        percent: SCOPE_PCT_START + SCOPE_PCT_RANGE,
+        message: 'Resolving types',
+        detail: 'complete',
+      });
+    }
+
     // Dispose the cross-phase Tree cache — scope-resolution is the
     // only consumer. Holding Trees past this point is pure memory
     // pressure: downstream phases (mro, community, csv-generator)
@@ -197,6 +305,7 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
       filesProcessed: totalFiles,
       importsEmitted: totalImports,
       referenceEdgesEmitted: totalRefs,
+      resolutionOutcomes,
       perLanguage,
     };
   },
