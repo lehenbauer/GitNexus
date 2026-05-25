@@ -64,13 +64,12 @@ function findSectionMarkerIndex(content: string, marker: string, startFrom = 0):
 /**
  * Generate the full GitNexus context content.
  *
- * Design principles (learned from real agent behavior and industry research):
+ * Design principles:
  * - Inline critical workflows — skills are skipped 56% of the time (Vercel eval data)
- * - Use RFC 2119 language (MUST, NEVER, ALWAYS) — models follow imperative rules
- * - Three-tier boundaries (Always/When/Never) — proven to change model behavior
+ * - Scope mandates to where they pay off (load-bearing edits), and carve out cosmetic
+ *   work so trivial tasks aren't taxed with ceremony that won't change the plan
  * - Keep under 120 lines — adherence degrades past 150 lines
  * - Exact tool commands with parameters — vague directives get ignored
- * - Self-review checklist — forces model to verify its own work
  */
 async function findGroupsContainingRegistryName(registryName: string): Promise<string[]> {
   const { listGroups, getDefaultGitnexusDir, getGroupDir } =
@@ -137,18 +136,19 @@ This project is indexed by GitNexus as **${projectName}**. Use the GitNexus MCP 
 
 ## Always Do
 
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run \`gitnexus_impact({target: "symbolName", direction: "upstream"})\` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run \`gitnexus_detect_changes()\` before committing** to verify your changes only affect expected symbols and execution flows.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
 - When exploring unfamiliar code, use \`gitnexus_query({query: "concept"})\` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
 - When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use \`gitnexus_context({name: "symbolName"})\`.
+- Before editing a symbol that looks load-bearing (exported API, called from many places, referenced in a hot execution flow), run \`gitnexus_impact({target: "symbolName", direction: "upstream"})\` and surface HIGH/CRITICAL findings to the user. Skip this for cosmetic/local edits (copy, styling, single-file refactors, layout) where the blast radius is obvious.
+- Use \`gitnexus_rename\` instead of find-and-replace for renames — it understands the call graph and avoids missed references.
 
 ## Never Do
 
-- NEVER edit a function, class, or method without first running \`gitnexus_impact\` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use \`gitnexus_rename\` which understands the call graph.
-- NEVER commit changes without running \`gitnexus_detect_changes()\` to check affected scope.
+- NEVER rename symbols with find-and-replace across the repo — use \`gitnexus_rename\`.
+- NEVER ignore a HIGH or CRITICAL impact finding silently — at minimum, mention it to the user before proceeding.
+
+## Optional diagnostics
+
+- \`gitnexus_detect_changes()\` can show which symbols and flows your edits touched. Useful when you're unsure of the scope of your changes; \`git diff\` covers the common case.
 
 ## Resources
 
