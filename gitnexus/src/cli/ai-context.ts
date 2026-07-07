@@ -1,9 +1,9 @@
 /**
  * AI Context Generator
  *
- * Creates AGENTS.md and CLAUDE.md with full inline GitNexus context.
+ * Creates AGENTS.md with inline GitNexus context and CLAUDE.md with an @AGENTS.md import stub.
  * AGENTS.md is the standard read by Cursor, Windsurf, OpenCode, Codex, Cline, etc.
- * CLAUDE.md is for Claude Code which only reads that file.
+ * CLAUDE.md is for Claude Code, which resolves the @AGENTS.md import.
  */
 
 import fs from 'fs/promises';
@@ -65,11 +65,11 @@ function findSectionMarkerIndex(content: string, marker: string, startFrom = 0):
  * Generate the full GitNexus context content.
  *
  * Design principles:
- * - Inline critical workflows — skills are skipped 56% of the time (Vercel eval data)
- * - Scope mandates to where they pay off (load-bearing edits), and carve out cosmetic
- *   work so trivial tasks aren't taxed with ceremony that won't change the plan
- * - Keep under 120 lines — adherence degrades past 150 lines
- * - Exact tool commands with parameters — vague directives get ignored
+ * - Keep the default block under ~20 lines so it is cheap to read every turn
+ * - Put usage rules in AGENTS.md once; CLAUDE.md imports them instead of duplicating
+ * - Scope mandates to structural questions and load-bearing edits, and carve out
+ *   cosmetic or single-file work where GitNexus will not change the plan
+ * - Include an explicit budget rule: one answer-producing query beats repeated checks
  */
 async function findGroupsContainingRegistryName(registryName: string): Promise<string[]> {
   const { listGroups, getDefaultGitnexusDir, getGroupDir } =
@@ -106,58 +106,26 @@ function generateGitNexusContent(
           .join('\n')
       : '';
 
-  // Standard skill rows reference files installed by installSkills(). When
-  // --skip-skills suppresses that install, these rows must be omitted — else
-  // AGENTS.md/CLAUDE.md would direct agents to read files that don't exist.
-  // Community skills (generatedRows) live in .claude/skills/generated/ and
-  // are independent of --skip-skills, so they remain when present.
-  const standardSkillsRows = skipSkills
-    ? ''
-    : `| Understand architecture / "How does X work?" | \`.claude/skills/gitnexus/gitnexus-exploring/SKILL.md\` |
-| Blast radius / "What breaks if I change X?" | \`.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md\` |
-| Trace bugs / "Why is X failing?" | \`.claude/skills/gitnexus/gitnexus-debugging/SKILL.md\` |
-| Rename / extract / split / refactor | \`.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md\` |
-| Tools, resources, schema reference | \`.claude/skills/gitnexus/gitnexus-guide/SKILL.md\` |
-| Index, status, clean, wiki CLI commands | \`.claude/skills/gitnexus/gitnexus-cli/SKILL.md\` |`;
-
-  const tableBody = [standardSkillsRows, generatedRows].filter(Boolean).join('\n');
-  const skillsTable = tableBody
+  const skillsTable = generatedRows
     ? `| Task | Read this skill file |
 |------|---------------------|
-${tableBody}`
+${generatedRows}`
     : '';
 
   return `${GITNEXUS_START_MARKER}
-# GitNexus — Code Intelligence
+## GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **${projectName}**. Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This repo is indexed by GitNexus as **${projectName}**. The GitNexus MCP tools answer questions from the call graph — faster and more reliable than grep when the answer spans files.
 
-> If any GitNexus tool warns the index is stale, run \`npx gitnexus analyze\` in terminal first.
+Reach for it when the question is structural:
 
-## Always Do
+- Trace a flow / "how does X work" → \`gitnexus_query({query: "concept"})\`
+- Blast radius before editing an exported or widely-called symbol → \`gitnexus_impact({target: "symbolName", direction: "upstream"})\`. Mention HIGH/CRITICAL findings to the user before proceeding — never silently.
+- Renames → \`gitnexus_rename\`, never repo-wide find-and-replace.
 
-- When exploring unfamiliar code, use \`gitnexus_query({query: "concept"})\` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use \`gitnexus_context({name: "symbolName"})\`.
-- Before editing a symbol that looks load-bearing (exported API, called from many places, referenced in a hot execution flow), run \`gitnexus_impact({target: "symbolName", direction: "upstream"})\` and surface HIGH/CRITICAL findings to the user. Skip this for cosmetic/local edits (copy, styling, single-file refactors, layout) where the blast radius is obvious.
-- Use \`gitnexus_rename\` instead of find-and-replace for renames — it understands the call graph and avoids missed references.
+Skip it when it won't change what you do: locating a known string or file (grep/Read is fine), cosmetic or single-file edits, docs/copy. One query that answers the question beats three that confirm it — stop when you have the answer.
 
-## Never Do
-
-- NEVER rename symbols with find-and-replace across the repo — use \`gitnexus_rename\`.
-- NEVER ignore a HIGH or CRITICAL impact finding silently — at minimum, mention it to the user before proceeding.
-
-## Optional diagnostics
-
-- \`gitnexus_detect_changes()\` can show which symbols and flows your edits touched. Useful when you're unsure of the scope of your changes; \`git diff\` covers the common case.
-
-## Resources
-
-| Resource | Use for |
-|----------|---------|
-| \`gitnexus://repo/${projectName}/context\` | Codebase overview, check index freshness |
-| \`gitnexus://repo/${projectName}/clusters\` | All functional areas |
-| \`gitnexus://repo/${projectName}/processes\` | All execution flows |
-| \`gitnexus://repo/${projectName}/process/{name}\` | Step-by-step execution trace |
+If a tool warns the index is stale, run \`npx gitnexus analyze\` first.
 
 ${
   groupNames && groupNames.length > 0
@@ -168,14 +136,26 @@ This repository is listed under GitNexus **group(s): ${groupNames.join(', ')}** 
 `
     : ''
 }${
-    skillsTable
-      ? `## CLI
+    !skipSkills
+      ? `Deeper guides (exploring, impact analysis, debugging, refactoring, tools reference, CLI): \`.claude/skills/gitnexus/\`.
 
-${skillsTable}
+`
+      : ''
+  }${
+    skillsTable
+      ? `${skillsTable}
 
 `
       : ''
   }${GITNEXUS_END_MARKER}`;
+}
+
+function generateClaudeAgentsImportStub(projectName: string): string {
+  return `${GITNEXUS_START_MARKER}
+## GitNexus — Code Intelligence
+
+This repo is indexed by GitNexus as **${projectName}**. The GitNexus usage rules live in the gitnexus block of AGENTS.md, imported here: @AGENTS.md
+${GITNEXUS_END_MARKER}`;
 }
 
 /**
@@ -375,7 +355,7 @@ export async function generateAIContextFiles(
   options?: AIContextOptions,
 ): Promise<{ files: string[] }> {
   const groupNames = await findGroupsContainingRegistryName(projectName);
-  const content = generateGitNexusContent(
+  const agentsContent = generateGitNexusContent(
     projectName,
     stats,
     generatedSkills,
@@ -383,6 +363,7 @@ export async function generateAIContextFiles(
     options?.noStats,
     options?.skipSkills,
   );
+  const claudeContent = generateClaudeAgentsImportStub(projectName);
   const createdFiles: string[] = [];
 
   if (!options?.skipAgentsMd) {
@@ -390,7 +371,7 @@ export async function generateAIContextFiles(
     const agentsPath = path.join(repoPath, 'AGENTS.md');
     const agentsResult = await upsertGitNexusSection(
       agentsPath,
-      content,
+      agentsContent,
       projectName,
       stats,
       options?.noStats,
@@ -401,7 +382,7 @@ export async function generateAIContextFiles(
     const claudePath = path.join(repoPath, 'CLAUDE.md');
     const claudeResult = await upsertGitNexusSection(
       claudePath,
-      content,
+      claudeContent,
       projectName,
       stats,
       options?.noStats,

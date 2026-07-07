@@ -95,61 +95,89 @@ describe('generateAIContextFiles', () => {
     }
   });
 
-  it('keeps the load-bearing repo-specific sections in the CLAUDE.md block (#856)', async () => {
-    // The trimmed block must still contain everything that is genuinely
-    // unique per repo or load-bearing for the agent: the freshness warning,
-    // the Always Do / Never Do imperative lists, the Resources URI table
-    // (projectName-interpolated), and the skills routing table that tells
-    // the agent which skill file to read for each task.
+  it('keeps the load-bearing usage rules in the AGENTS.md block (#856)', async () => {
     const stats = { nodes: 50, edges: 100, processes: 5 };
     await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats);
 
-    const content = await fs.readFile(path.join(tmpDir, 'CLAUDE.md'), 'utf-8');
+    const content = await fs.readFile(path.join(tmpDir, 'AGENTS.md'), 'utf-8');
 
-    expect(content).toContain('If any GitNexus tool warns the index is stale');
-    expect(content).toContain('## Always Do');
-    expect(content).toContain('## Never Do');
-    expect(content).toContain('## Resources');
-    expect(content).toContain('gitnexus://repo/TestProject/context');
-    expect(content).toContain('gitnexus-impact-analysis/SKILL.md');
-    expect(content).toContain('gitnexus-refactoring/SKILL.md');
-    expect(content).toContain('gitnexus-debugging/SKILL.md');
-    expect(content).toContain('gitnexus-cli/SKILL.md');
-  });
-
-  it('does not duplicate content that already lives in skill files (#856)', async () => {
-    // The six sections listed in issue #856 are redundant with the skill
-    // files shipped alongside the CLAUDE.md block (both are loaded into
-    // every Claude Code session). Their absence is the whole point of the
-    // trim — assert each header is gone so a future regression that pads
-    // the block back out fails here.
-    const stats = { nodes: 50, edges: 100, processes: 5 };
-    await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats);
-
-    const content = await fs.readFile(path.join(tmpDir, 'CLAUDE.md'), 'utf-8');
-
-    expect(content).not.toContain('## Tools Quick Reference');
-    expect(content).not.toContain('## Impact Risk Levels');
-    expect(content).not.toContain('## Self-Check Before Finishing');
-    expect(content).not.toContain('## When Debugging');
-    expect(content).not.toContain('## When Refactoring');
-    expect(content).not.toContain('## Keeping the Index Fresh');
-  });
-
-  it('keeps the CLAUDE.md GitNexus block under the token-cost budget (#856)', async () => {
-    // The pre-trim block was ~5465 chars. After #856 it's ~2580 — about a
-    // 52% reduction. 2700 is a soft ceiling that still leaves headroom for
-    // legitimate future additions but will fail loudly if the trim is
-    // reverted or someone pads the block back out toward the original size.
-    const stats = { nodes: 50, edges: 100, processes: 5 };
-    await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats);
-
-    const content = await fs.readFile(path.join(tmpDir, 'CLAUDE.md'), 'utf-8');
-    const block = content.slice(
-      content.indexOf('<!-- gitnexus:start -->'),
-      content.indexOf('<!-- gitnexus:end -->'),
+    expect(content).toContain('This repo is indexed by GitNexus as **TestProject**');
+    expect(content).toContain('Trace a flow / "how does X work"');
+    expect(content).toContain(
+      'Blast radius before editing an exported or widely-called symbol',
     );
-    expect(block.length).toBeLessThan(2700);
+    expect(content).toContain('Renames → `gitnexus_rename`, never repo-wide find-and-replace.');
+    expect(content).toContain('stop when you have the answer');
+    expect(content).toContain('If a tool warns the index is stale');
+    expect(content).toContain(
+      'Deeper guides (exploring, impact analysis, debugging, refactoring, tools reference, CLI): `.claude/skills/gitnexus/`.',
+    );
+    expect(content).not.toContain('## Always Do');
+  });
+
+  it('writes CLAUDE.md as an @AGENTS.md import stub', async () => {
+    const stats = { nodes: 50, edges: 100, processes: 5 };
+    await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats);
+
+    const content = await fs.readFile(path.join(tmpDir, 'CLAUDE.md'), 'utf-8');
+
+    expect(content).toContain(
+      'The GitNexus usage rules live in the gitnexus block of AGENTS.md, imported here: @AGENTS.md',
+    );
+    expect(content).not.toMatch(/`@AGENTS\.md`/);
+    expect(content).not.toContain('Trace a flow / "how does X work"');
+    expect(content).not.toContain('Blast radius before editing');
+    expect(content).not.toContain('Renames →');
+    expect(content).not.toContain('## Always Do');
+  });
+
+  it('does not include deleted verbose sections in generated context (#856)', async () => {
+    const stats = { nodes: 50, edges: 100, processes: 5 };
+    await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats);
+
+    const agentsContent = await fs.readFile(path.join(tmpDir, 'AGENTS.md'), 'utf-8');
+    const claudeContent = await fs.readFile(path.join(tmpDir, 'CLAUDE.md'), 'utf-8');
+
+    for (const content of [agentsContent, claudeContent]) {
+      expect(content).not.toContain('## Always Do');
+      expect(content).not.toContain('## Never Do');
+      expect(content).not.toContain('gitnexus_context');
+      expect(content).not.toContain('gitnexus_detect_changes');
+      expect(content).not.toContain('## Resources');
+      expect(content).not.toContain('gitnexus://repo/TestProject/context');
+      expect(content).not.toContain('gitnexus-impact-analysis/SKILL.md');
+      expect(content).not.toContain('gitnexus-refactoring/SKILL.md');
+      expect(content).not.toContain('gitnexus-debugging/SKILL.md');
+      expect(content).not.toContain('gitnexus-cli/SKILL.md');
+    }
+
+    for (const content of [agentsContent, claudeContent]) {
+      expect(content).not.toContain('## Tools Quick Reference');
+      expect(content).not.toContain('## Impact Risk Levels');
+      expect(content).not.toContain('## Self-Check Before Finishing');
+      expect(content).not.toContain('## When Debugging');
+      expect(content).not.toContain('## When Refactoring');
+      expect(content).not.toContain('## Keeping the Index Fresh');
+    }
+  });
+
+  it('keeps generated GitNexus blocks under the token-cost budget (#856)', async () => {
+    const stats = { nodes: 50, edges: 100, processes: 5 };
+    await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats);
+
+    const agentsContent = await fs.readFile(path.join(tmpDir, 'AGENTS.md'), 'utf-8');
+    const claudeContent = await fs.readFile(path.join(tmpDir, 'CLAUDE.md'), 'utf-8');
+    const agentsBlock = agentsContent.slice(
+      agentsContent.indexOf('<!-- gitnexus:start -->'),
+      agentsContent.indexOf('<!-- gitnexus:end -->'),
+    );
+    const claudeBlock = claudeContent.slice(
+      claudeContent.indexOf('<!-- gitnexus:start -->'),
+      claudeContent.indexOf('<!-- gitnexus:end -->'),
+    );
+    expect(agentsBlock.length).toBeLessThan(1800);
+    expect(agentsBlock.split('\n').length).toBeLessThanOrEqual(24);
+    expect(claudeBlock.length).toBeLessThan(350);
   });
 
   it('handles empty stats', async () => {
@@ -240,8 +268,10 @@ Old content here.
 
     const result = await fs.readFile(agentsPath, 'utf-8');
 
-    // Should have the full verbose template
-    expect(result).toContain('## Always Do');
+    // Should have the lean full AGENTS.md template
+    expect(result).toContain('Reach for it when the question is structural:');
+    expect(result).toContain('stop when you have the answer');
+    expect(result).not.toContain('## Always Do');
     expect(result).not.toContain('Old content here');
   });
 
@@ -321,13 +351,10 @@ Old content here.
   });
 
   it('omits standard skill references from AGENTS.md/CLAUDE.md when skipSkills is true (#742)', async () => {
-    // The skills routing table in AGENTS.md/CLAUDE.md points agents at
-    // .claude/skills/gitnexus/*/SKILL.md files installed by installSkills().
-    // When --skip-skills suppresses that install but AGENTS.md/CLAUDE.md
-    // are still written, the routing table must NOT name files that don't
-    // exist — otherwise every agent load incurs 6 failed reads and the
-    // routing instructions are worthless. Per-test tmpdir so the assertions
-    // are not contaminated by a CLAUDE.md from an earlier test.
+    // The AGENTS.md deeper-guides pointer names .claude/skills/gitnexus/,
+    // which installSkills() creates. When --skip-skills suppresses that
+    // install but AGENTS.md/CLAUDE.md are still written, generated context
+    // must not point agents at missing files.
     const noStdDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-ai-ctx-no-std-skills-'));
     const noStdStorage = path.join(noStdDir, '.gitnexus');
     await fs.mkdir(noStdStorage, { recursive: true });
@@ -337,18 +364,21 @@ Old content here.
         skipSkills: true,
       });
 
-      const content = await fs.readFile(path.join(noStdDir, 'CLAUDE.md'), 'utf-8');
-      expect(content).not.toContain('gitnexus-exploring/SKILL.md');
-      expect(content).not.toContain('gitnexus-impact-analysis/SKILL.md');
-      expect(content).not.toContain('gitnexus-debugging/SKILL.md');
-      expect(content).not.toContain('gitnexus-refactoring/SKILL.md');
-      expect(content).not.toContain('gitnexus-guide/SKILL.md');
-      expect(content).not.toContain('gitnexus-cli/SKILL.md');
-      // The load-bearing imperative sections must still ship — only the
-      // routing rows are conditional.
-      expect(content).toContain('## Always Do');
-      expect(content).toContain('## Never Do');
-      expect(content).toContain('gitnexus://repo/TestProject/context');
+      const agentsContent = await fs.readFile(path.join(noStdDir, 'AGENTS.md'), 'utf-8');
+      const claudeContent = await fs.readFile(path.join(noStdDir, 'CLAUDE.md'), 'utf-8');
+
+      expect(agentsContent).not.toContain('.claude/skills/gitnexus/');
+      expect(agentsContent).not.toContain('gitnexus-exploring/SKILL.md');
+      expect(agentsContent).not.toContain('gitnexus-impact-analysis/SKILL.md');
+      expect(agentsContent).not.toContain('gitnexus-debugging/SKILL.md');
+      expect(agentsContent).not.toContain('gitnexus-refactoring/SKILL.md');
+      expect(agentsContent).not.toContain('gitnexus-guide/SKILL.md');
+      expect(agentsContent).not.toContain('gitnexus-cli/SKILL.md');
+      expect(agentsContent).toContain('Reach for it when the question is structural:');
+      expect(agentsContent).toContain('stop when you have the answer');
+
+      expect(claudeContent).toContain('@AGENTS.md');
+      expect(claudeContent).not.toContain('.claude/skills/gitnexus/');
     } finally {
       await fs.rm(noStdDir, { recursive: true, force: true });
     }
@@ -503,9 +533,8 @@ Old content here.
     try {
       const claudePath = path.join(dir, 'CLAUDE.md');
       // Keep marker appears in user prose BEFORE the GitNexus section.
-      // The keep-path must NOT be triggered — full template replacement
-      // is the correct behavior here, because the marker is not inside
-      // the generated block.
+      // The keep-path must NOT be triggered — generated replacement is
+      // the correct behavior here, because the marker is not inside the block.
       const fileWithOutOfBandMarker = `# My Project
 
 A note about <!-- gitnexus:keep --> markers: they only apply inside the
@@ -522,7 +551,8 @@ Old verbose stub here.
 
       const result = await fs.readFile(claudePath, 'utf-8');
       // Section MUST have been fully replaced — keep marker outside section ignored
-      expect(result).toContain('## Always Do');
+      expect(result).toContain('@AGENTS.md');
+      expect(result).not.toContain('## Always Do');
       expect(result).not.toContain('Old verbose stub here.');
       // User's prose with the marker reference is preserved untouched
       expect(result).toContain('A note about <!-- gitnexus:keep --> markers');

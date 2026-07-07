@@ -48,6 +48,7 @@ Commands and gotchas live under **Repo reference** below and in **[CONTRIBUTING.
 
 | Date | Version | Change |
 |------|---------|--------|
+| 2026-07-07 | 1.9.0 | Lean gitnexus block (~15 lines): structural-question triggers, skip guidance, stop rule; dropped Always/Never Do, resources table, standard-skills table. CLAUDE.md now imports it via a stub. |
 | 2026-05-22 | 1.8.0 | Kotlin added to `MIGRATED_LANGUAGES` (registry-primary call resolution by default). Closes #1756 (companion-vs-instance dispatch) and #1757 (lambda scopes); refs #1746. RFC §6.4 corpus criterion waived (corpus-mode wiring is #927-scope); fixture criterion met. |
 | 2026-04-23 | 1.7.0 | TypeScript added to `MIGRATED_LANGUAGES` (registry-primary call resolution by default). |
 | 2026-04-20 | 1.6.0 | Added scope-resolution pipeline pointer (RFC #909 Ring 3); Python migrated to registry-primary. |
@@ -61,47 +62,21 @@ Commands and gotchas live under **Repo reference** below and in **[CONTRIBUTING.
 ---
 
 <!-- gitnexus:start -->
-# GitNexus — Code Intelligence
+## GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **GitNexus**. Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This repo is indexed by GitNexus as **GitNexus**. The GitNexus MCP tools answer questions from the call graph — faster and more reliable than grep when the answer spans files.
 
-> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
+Reach for it when the question is structural:
 
-## Always Do
+- Trace a flow / "how does X work" → `gitnexus_query({query: "concept"})`
+- Blast radius before editing an exported or widely-called symbol → `gitnexus_impact({target: "symbolName", direction: "upstream"})`. Mention HIGH/CRITICAL findings to the user before proceeding — never silently.
+- Renames → `gitnexus_rename`, never repo-wide find-and-replace.
 
-- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
-- Before editing a symbol that looks load-bearing (exported API, called from many places, referenced in a hot execution flow), run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and surface HIGH/CRITICAL findings to the user. Skip this for cosmetic/local edits (copy, styling, single-file refactors, layout) where the blast radius is obvious.
-- Use `gitnexus_rename` instead of find-and-replace for renames — it understands the call graph and avoids missed references.
+Skip it when it won't change what you do: locating a known string or file (grep/Read is fine), cosmetic or single-file edits, docs/copy. One query that answers the question beats three that confirm it — stop when you have the answer.
 
-## Never Do
+If a tool warns the index is stale, run `npx gitnexus analyze` first.
 
-- NEVER rename symbols with find-and-replace across the repo — use `gitnexus_rename`.
-- NEVER ignore a HIGH or CRITICAL impact finding silently — at minimum, mention it to the user before proceeding.
-
-## Optional diagnostics
-
-- `gitnexus_detect_changes()` can show which symbols and flows your edits touched. Useful when you're unsure of the scope of your changes; `git diff` covers the common case.
-
-## Resources
-
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/GitNexus/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/GitNexus/clusters` | All functional areas |
-| `gitnexus://repo/GitNexus/processes` | All execution flows |
-| `gitnexus://repo/GitNexus/process/{name}` | Step-by-step execution trace |
-
-## CLI
-
-| Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+Deeper guides (exploring, impact analysis, debugging, refactoring, tools reference, CLI): `.claude/skills/gitnexus/`.
 
 <!-- gitnexus:end -->
 
