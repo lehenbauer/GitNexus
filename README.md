@@ -2,7 +2,7 @@
 
 > **Fork notice — this is standard GitNexus except:**
 > - **Quieter commits.** Volatile index counts (symbol/edge totals) no longer get rewritten into `AGENTS.md`/`CLAUDE.md` on every analyze, so the AI-context files stop polluting unrelated diffs.
-> - **Lighter agent instructions.** The injected "Always Do / Never Do" block has been toned down: impact analysis is scoped to load-bearing edits (with an explicit carve-out for cosmetic work like copy, styling, and layout), and the per-commit `detect_changes` mandate is gone. The goal is to trade a bit of ceremony for noticeably faster development on small changes, while keeping the high-value tools (`gitnexus_query`, `gitnexus_context`, `gitnexus_impact` on risky edits, `gitnexus_rename`) prominent.
+> - **Opt-in agent instructions.** The injected gitnexus block is a short specialist guide, not a pre-edit gate: use graph tools when multi-file structure is the bottleneck; skip for local/HTML/CSS/config/single-file work. No Always/Never Do, no mandatory blast-radius before edits, no per-commit `detect_changes`. CLAUDE.md imports AGENTS.md once. MCP tool "next" hints are optional, not a forced chain.
 >
 > Everything below is upstream documentation and applies unchanged.
 

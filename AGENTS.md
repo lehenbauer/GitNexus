@@ -48,6 +48,7 @@ Commands and gotchas live under **Repo reference** below and in **[CONTRIBUTING.
 
 | Date | Version | Change |
 |------|---------|--------|
+| 2026-07-20 | 1.10.0 | Opt-in gitnexus block: no pre-edit impact gate; explicit skip for HTML/CSS/configs/local work; soft "useful when" framing for multi-file graph questions. |
 | 2026-07-07 | 1.9.0 | Lean gitnexus block (~15 lines): structural-question triggers, skip guidance, stop rule; dropped Always/Never Do, resources table, standard-skills table. CLAUDE.md now imports it via a stub. |
 | 2026-05-22 | 1.8.0 | Kotlin added to `MIGRATED_LANGUAGES` (registry-primary call resolution by default). Closes #1756 (companion-vs-instance dispatch) and #1757 (lambda scopes); refs #1746. RFC §6.4 corpus criterion waived (corpus-mode wiring is #927-scope); fixture criterion met. |
 | 2026-04-23 | 1.7.0 | TypeScript added to `MIGRATED_LANGUAGES` (registry-primary call resolution by default). |
@@ -64,17 +65,16 @@ Commands and gotchas live under **Repo reference** below and in **[CONTRIBUTING.
 <!-- gitnexus:start -->
 ## GitNexus — Code Intelligence
 
-This repo is indexed by GitNexus as **GitNexus**. The GitNexus MCP tools answer questions from the call graph — faster and more reliable than grep when the answer spans files.
+This repo is indexed as **GitNexus**. Optional MCP tools over the call/import graph — not a default step for every edit.
 
-Reach for it when the question is structural:
+**Useful when** the hard part is multi-file structure a single grep or file read will not show:
+- Who calls / depends on a symbol across modules → `gitnexus_impact` / `gitnexus_context`
+- How a concept is wired end-to-end → `gitnexus_query`
+- Multi-file rename of a symbol with many graph refs → `gitnexus_rename`
 
-- Trace a flow / "how does X work" → `gitnexus_query({query: "concept"})`
-- Blast radius before editing an exported or widely-called symbol → `gitnexus_impact({target: "symbolName", direction: "upstream"})`. Mention HIGH/CRITICAL findings to the user before proceeding — never silently.
-- Renames → `gitnexus_rename`, never repo-wide find-and-replace.
+**Skip for** local or non-graph work: known path or string, single-file edits, HTML/CSS/markup, copy, configs, fixtures, generated files, tests you already have open. Prefer normal editor tools there. One graph query that answers the question is enough — do not chain impact/context by habit.
 
-Skip it when it won't change what you do: locating a known string or file (grep/Read is fine), cosmetic or single-file edits, docs/copy. One query that answers the question beats three that confirm it — stop when you have the answer.
-
-If a tool warns the index is stale, run `npx gitnexus analyze` first.
+If a tool says the index is stale *and* you still need graph answers, run `npx gitnexus analyze`. Otherwise ignore staleness.
 
 Deeper guides (exploring, impact analysis, debugging, refactoring, tools reference, CLI): `.claude/skills/gitnexus/`.
 

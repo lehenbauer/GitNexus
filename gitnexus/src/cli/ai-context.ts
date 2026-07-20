@@ -67,9 +67,9 @@ function findSectionMarkerIndex(content: string, marker: string, startFrom = 0):
  * Design principles:
  * - Keep the default block under ~20 lines so it is cheap to read every turn
  * - Put usage rules in AGENTS.md once; CLAUDE.md imports them instead of duplicating
- * - Scope mandates to structural questions and load-bearing edits, and carve out
- *   cosmetic or single-file work where GitNexus will not change the plan
- * - Include an explicit budget rule: one answer-producing query beats repeated checks
+ * - Opt-in specialist, not a pre-edit gate: prefer Read/grep for local work
+ * - Be specific about when multi-hop graph tools pay off vs when they don't
+ * - No MUST/NEVER; frontier models over-apply hard rules to HTML, configs, etc.
  */
 async function findGroupsContainingRegistryName(registryName: string): Promise<string[]> {
   const { listGroups, getDefaultGitnexusDir, getGroupDir } =
@@ -115,17 +115,16 @@ ${generatedRows}`
   return `${GITNEXUS_START_MARKER}
 ## GitNexus — Code Intelligence
 
-This repo is indexed by GitNexus as **${projectName}**. The GitNexus MCP tools answer questions from the call graph — faster and more reliable than grep when the answer spans files.
+This repo is indexed as **${projectName}**. Optional MCP tools over the call/import graph — not a default step for every edit.
 
-Reach for it when the question is structural:
+**Useful when** the hard part is multi-file structure a single grep or file read will not show:
+- Who calls / depends on a symbol across modules → \`gitnexus_impact\` / \`gitnexus_context\`
+- How a concept is wired end-to-end → \`gitnexus_query\`
+- Multi-file rename of a symbol with many graph refs → \`gitnexus_rename\`
 
-- Trace a flow / "how does X work" → \`gitnexus_query({query: "concept"})\`
-- Blast radius before editing an exported or widely-called symbol → \`gitnexus_impact({target: "symbolName", direction: "upstream"})\`. Mention HIGH/CRITICAL findings to the user before proceeding — never silently.
-- Renames → \`gitnexus_rename\`, never repo-wide find-and-replace.
+**Skip for** local or non-graph work: known path or string, single-file edits, HTML/CSS/markup, copy, configs, fixtures, generated files, tests you already have open. Prefer normal editor tools there. One graph query that answers the question is enough — do not chain impact/context by habit.
 
-Skip it when it won't change what you do: locating a known string or file (grep/Read is fine), cosmetic or single-file edits, docs/copy. One query that answers the question beats three that confirm it — stop when you have the answer.
-
-If a tool warns the index is stale, run \`npx gitnexus analyze\` first.
+If a tool says the index is stale *and* you still need graph answers, run \`npx gitnexus analyze\`. Otherwise ignore staleness.
 
 ${
   groupNames && groupNames.length > 0
@@ -154,7 +153,7 @@ function generateClaudeAgentsImportStub(projectName: string): string {
   return `${GITNEXUS_START_MARKER}
 ## GitNexus — Code Intelligence
 
-This repo is indexed by GitNexus as **${projectName}**. The GitNexus usage rules live in the gitnexus block of AGENTS.md, imported here: @AGENTS.md
+This repo is indexed as **${projectName}**. Optional graph tools; usage guidance lives in the gitnexus block of AGENTS.md, imported here: @AGENTS.md
 ${GITNEXUS_END_MARKER}`;
 }
 

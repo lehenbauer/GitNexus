@@ -29,13 +29,11 @@ import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
 
 /**
- * Next-step hints appended to tool responses.
+ * Optional follow-ups appended to tool responses.
  *
- * Agents often stop after one tool call. These hints guide them to the
- * logical next action, creating a self-guiding workflow without hooks.
- *
- * Design: Each hint is a short, actionable instruction (not a suggestion).
- * The hint references the specific tool/resource to use next.
+ * Keep these soft: hard "Next: always run X" chains cause cargo-cult tool
+ * use (impact after every context, etc.). Only hint when a deeper graph
+ * step is genuinely optional and useful — never a pre-edit gate.
  */
 function getNextStepHint(toolName: string, args: Record<string, any> | undefined): string {
   const repo = args?.repo;
@@ -44,33 +42,33 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
 
   switch (toolName) {
     case 'list_repos':
-      return `\n\n---\n**Next:** READ gitnexus://repo/{name}/context for any repo above to get its overview and check staleness.`;
+      return `\n\n---\n**Optional:** READ gitnexus://repo/{name}/context if you need an overview or staleness check.`;
 
     case 'query':
-      return `\n\n---\n**Next:** To understand a specific symbol in depth, use context({name: "<symbol_name>"${repoParam}}) to see categorized refs and process participation.`;
+      return `\n\n---\n**Optional:** context({name: "<symbol>"${repoParam}}) only if you need callers/callees for a specific symbol above.`;
 
     case 'context':
-      return `\n\n---\n**Next:** If planning changes, use impact({target: "${args?.name || '<name>'}", direction: "upstream"${repoParam}}) to check blast radius. To see execution flows, READ gitnexus://repo/${repoPath}/processes.`;
+      return `\n\n---\n**Optional:** impact({target: "${args?.name || '<name>'}", direction: "upstream"${repoParam}}) only if you need a multi-file dependency map before a risky change — skip for local/single-file edits.`;
 
     case 'impact':
-      return `\n\n---\n**Next:** Review d=1 items first (WILL BREAK). To check affected execution flows, READ gitnexus://repo/${repoPath}/processes.`;
+      return `\n\n---\n**Optional:** Focus on d=1 (WILL BREAK) if any; otherwise proceed from what you already have.`;
 
     case 'detect_changes':
-      return `\n\n---\n**Next:** Review affected processes. Use context() on high-risk changed symbols. READ gitnexus://repo/${repoPath}/process/{name} for full execution traces.`;
+      return `\n\n---\n**Optional:** context() on a high-risk changed symbol only if scope is still unclear.`;
 
     case 'rename':
-      return `\n\n---\n**Next:** Run detect_changes(${repoParam ? `{repo: "${repo}"}` : ''}) to verify no unexpected side effects from the rename.`;
+      return `\n\n---\n**Optional:** detect_changes(${repoParam ? `{repo: "${repo}"}` : ''}) if you want a graph-level scope check; git diff usually suffices.`;
 
     case 'cypher':
-      return `\n\n---\n**Next:** To explore a result symbol, use context({name: "<name>"${repoParam}}). For schema reference, READ gitnexus://repo/${repoPath}/schema.`;
+      return `\n\n---\n**Optional:** context({name: "<name>"${repoParam}}) for a result symbol, or READ gitnexus://repo/${repoPath}/schema for the schema.`;
 
     // Legacy tool names — still return useful hints
     case 'search':
-      return `\n\n---\n**Next:** To understand a result in context, use context({name: "<symbol_name>"${repoParam}}).`;
+      return `\n\n---\n**Optional:** context({name: "<symbol>"${repoParam}}) if you need callers/callees for a result.`;
     case 'explore':
-      return `\n\n---\n**Next:** If planning changes, use impact({target: "<name>", direction: "upstream"${repoParam}}).`;
+      return `\n\n---\n**Optional:** impact({target: "<name>", direction: "upstream"${repoParam}}) only for multi-file risk analysis.`;
     case 'overview':
-      return `\n\n---\n**Next:** To drill into an area, READ gitnexus://repo/${repoPath}/cluster/{name}. To see execution flows, READ gitnexus://repo/${repoPath}/processes.`;
+      return `\n\n---\n**Optional:** READ gitnexus://repo/${repoPath}/cluster/{name} or processes if you need to drill in.`;
 
     default:
       return '';

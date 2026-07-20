@@ -42,6 +42,7 @@ If always-on instructions grow, load deep conventions via conditional reads (e.g
 
 | Date | Version | Change |
 |------|---------|--------|
+| 2026-07-20 | 1.5.0 | GitNexus block is opt-in specialist guidance (see AGENTS.md 1.10.0); CLAUDE.md remains the import stub. |
 | 2026-07-07 | 1.4.0 | Lean gitnexus block: CLAUDE.md now carries an import stub; full rules live once in AGENTS.md. |
 | 2026-04-13 | 1.3.0 | Updated GitNexus index stats after DAG refactor. |
 | 2026-03-24 | 1.2.0 | Removed duplicated gitnexus:start block and scope table; replaced with pointers to AGENTS.md. |
@@ -57,5 +58,5 @@ See the `<!-- gitnexus:start --> … <!-- gitnexus:end -->` block in **[AGENTS.m
 <!-- gitnexus:start -->
 ## GitNexus — Code Intelligence
 
-This repo is indexed by GitNexus as **GitNexus**. The GitNexus usage rules live in the gitnexus block of AGENTS.md, imported here: @AGENTS.md
+This repo is indexed as **GitNexus**. Optional graph tools; usage guidance lives in the gitnexus block of AGENTS.md, imported here: @AGENTS.md
 <!-- gitnexus:end -->
