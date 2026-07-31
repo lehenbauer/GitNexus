@@ -638,12 +638,16 @@ export interface RepoMeta {
  * failing closed (no edge) through the reuse gate. Force a full re-analyze.
  *
  * v31 (fork): the CONTAINS DDL gains Enum→{Function, Method, Struct,
- * Constructor, Property, TypeAlias} pairs — Swift enums carry computed
- * properties, methods, inits, and nested types, and analyze fail-fasts in
- * RelPairRouter on the first undeclared pair. A pre-v31 database physically
- * lacks those rel tables, so an incremental top-up emitting one would fail at
- * the DB layer. Force a full re-analyze. (Fork numbering: re-check against
- * upstream's constant on the next merge — see the v25/v26 collision note.)
+ * Constructor, Property, TypeAlias}, Method→Variable, and
+ * Property→{Class, Enum, Function, Struct} pairs — Swift enums carry
+ * computed properties, methods, inits, and nested types; method bodies
+ * declare local variables; computed-property bodies define nested types and
+ * functions. RelPairRouter fail-fasts on the first undeclared pair (the full
+ * set was enumerated by a log-and-skip collection pass over a large Swift
+ * codebase). A pre-v31 database physically lacks those rel tables, so an
+ * incremental top-up emitting one would fail at the DB layer. Force a full
+ * re-analyze. (Fork numbering: re-check against upstream's constant on the
+ * next merge — see the v25/v26 collision note.)
  */
 export const INCREMENTAL_SCHEMA_VERSION = 31;
 
