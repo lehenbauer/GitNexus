@@ -57,4 +57,84 @@ describe('Swift conditional-directive preprocessing', () => {
     expect(rewritten).toContain('      \r\n');
     expect(rewritten).toContain('\tenum A { case x }\r\n');
   });
+
+  it('leaves regular and raw multiline string interiors byte-identical', () => {
+    const source = [
+      'struct Strings {',
+      '  let regular = """',
+      '  #if os(iOS)',
+      '  #elseif DEBUG',
+      '  #else',
+      '  #endif',
+      '  """',
+      '  #if REAL_DIRECTIVE',
+      '  let between = true',
+      '  #endif',
+      '  let raw = #"""',
+      '  #if raw(iOS)',
+      '  #elseif raw(DEBUG)',
+      '  #else',
+      '  #endif',
+      '  """#',
+      '  let doubleRaw = ##"""',
+      '  #if double-raw-string-data',
+      '  #endif',
+      '  """##',
+      '}',
+    ].join('\n');
+
+    const rewritten = preprocessSwiftConditionalDirectives(source);
+    const sourceLines = source.split('\n');
+    const rewrittenLines = rewritten.split('\n');
+
+    expect(rewritten).toHaveLength(source.length);
+    for (const line of [2, 3, 4, 5, 11, 12, 13, 14, 17, 18]) {
+      expect(rewrittenLines[line]).toBe(sourceLines[line]);
+    }
+    for (const line of [7, 9]) {
+      expect(rewrittenLines[line]).toBe(''.padEnd(sourceLines[line]!.length, ' '));
+    }
+  });
+
+  it('does not let an unterminated multiline string blank later lines', () => {
+    const source = ['let text = """', '  #if this-is-string-data', '  still string data'].join('\n');
+
+    expect(preprocessSwiftConditionalDirectives(source)).toBe(source);
+  });
+
+  it('leaves non-conditional hash directives untouched', () => {
+    const source = [
+      'class Directives {',
+      '  #warning("warning")',
+      '  #error("error")',
+      '  #available(iOS 17, *)',
+      '  #selector(getter: Directives.value)',
+      '  #if DEBUG',
+      '  #endif',
+      '}',
+    ].join('\n');
+    const rewritten = preprocessSwiftConditionalDirectives(source);
+
+    expect(rewritten.split('\n').slice(1, 5)).toEqual(source.split('\n').slice(1, 5));
+    expect(rewritten.split('\n')[5]).toBe(''.padEnd(source.split('\n')[5]!.length, ' '));
+    expect(rewritten.split('\n')[6]).toBe(''.padEnd(source.split('\n')[6]!.length, ' '));
+  });
+
+  it('keeps nested block comments out of string state while retaining comment blanking', () => {
+    const source = [
+      '/*',
+      '  #if in-comment',
+      '  /* nested comment */',
+      '  #endif',
+      '*/',
+      'let text = """',
+      '  #if in-string',
+      '"""',
+    ].join('\n');
+    const rewrittenLines = preprocessSwiftConditionalDirectives(source).split('\n');
+
+    expect(rewrittenLines[1]).toBe(''.padEnd(source.split('\n')[1]!.length, ' '));
+    expect(rewrittenLines[3]).toBe(''.padEnd(source.split('\n')[3]!.length, ' '));
+    expect(rewrittenLines[6]).toBe('  #if in-string');
+  });
 });
