@@ -126,6 +126,8 @@ This repo is indexed as **${projectName}**. Optional MCP tools over the call/imp
 
 If a tool says the index is stale *and* you still need graph answers, run \`npx gitnexus analyze\`. Otherwise ignore staleness.
 
+**Worktrees:** queries work from any checkout. To graph a linked worktree's branch, run \`npx gitnexus analyze --index-only --name ${projectName}-<branch>\` from the worktree root — its index lives in that worktree's own \`.gitnexus/\`, separate from this one. \`npx gitnexus remove <worktree-path> --force\` cleans it up when the branch work ends.
+
 ${
   groupNames && groupNames.length > 0
     ? `## Cross-Repo Groups
