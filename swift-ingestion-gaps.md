@@ -4,6 +4,12 @@ Tracks missing Swift features in the GitNexus ingestion pipeline. Organized by p
 
 ## 🔴 High Priority
 
+### Symbol Extraction — very large class bodies
+
+| Gap | Description | Impact |
+|-----|-------------|--------|
+| Outer class dropped in very large files | A ~15.8K-line file whose top-level `@Observable class` spans ~15.3K lines (whisp `TerminalMirrorViewModel.swift`) produces NO node for the outer class; its nested classes/enums surface as top-level nodes instead — consistent with a mid-file tree-sitter parse break swallowing the enclosing declaration. Reproduces in a single-file fixture on both 1.6.5 (`bfa19d39`) and post-merge 1.6.9, so pre-existing, not a merge regression. Not attribute-related: other `@Observable` classes index fine. | The largest/most central class in a codebase is invisible to query/context/impact |
+
 ### Type Inference
 
 | Gap | Description | Impact |
