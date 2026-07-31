@@ -4,11 +4,11 @@ Tracks missing Swift features in the GitNexus ingestion pipeline. Organized by p
 
 ## 🔴 High Priority
 
-### Symbol Extraction — very large class bodies
+### Symbol Extraction — conditional directives in type bodies (MITIGATED)
 
 | Gap | Description | Impact |
 |-----|-------------|--------|
-| Outer class dropped in very large files | A ~15.8K-line file whose top-level `@Observable class` spans ~15.3K lines (whisp `TerminalMirrorViewModel.swift`) produces NO node for the outer class; its nested classes/enums surface as top-level nodes instead — consistent with a mid-file tree-sitter parse break swallowing the enclosing declaration. Reproduces in a single-file fixture on both 1.6.5 (`bfa19d39`) and post-merge 1.6.9, so pre-existing, not a merge regression. Not attribute-related: other `@Observable` classes index fine. | The largest/most central class in a codebase is invisible to query/context/impact |
+| Outer class dropped when a class body contains an indented `#if` | NOT size-related: tree-sitter-swift 0.7.1's `class_body` does not admit `directive`, so an indented `#if`/`#elseif`/`#else`/`#endif` between members throws the parser into error recovery — the enclosing `class_declaration` dissolves into an ERROR node and recovered members surface at file scope (six-line repro; found via whisp `TerminalMirrorViewModel.swift:474`). **Mitigated** by the string-aware `preprocessSource` hook (`languages/swift/conditional-directive-preprocess.ts`, commits `e3239156`+`bb02ca89`; upstreamed as GitNexus PR #2769-follow-up #2771). Tradeoffs: all conditional branches visible to the parser; same-signature duplicate declarations collapse to the first; interpolation-nested multiline strings are a documented scanner residual. **Retire this mitigation when re-vendoring a tree-sitter-swift release containing merged upstream grammar PR alex-pinkus/tree-sitter-swift#583** (issue #298, follow-up #599). | Without the mitigation, the largest/most central class in a codebase is invisible to query/context/impact |
 
 ### Type Inference
 
