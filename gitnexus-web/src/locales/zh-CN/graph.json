@@ -10,7 +10,8 @@
     "status": {
       "running": "运行中",
       "completed": "已完成",
-      "error": "错误"
+      "error": "错误",
+      "stopped": "已停止"
     },
     "tools": {
       "search": "🔍 搜索代码",
@@ -112,6 +113,12 @@
     "codeNotAvailable": "内存中没有 {{path}} 的代码内容"
   },
   "canvas": {
+    "viewModes": {
+      "label": "图形视图模式",
+      "force": "力导向图",
+      "tree": "顺序布局",
+      "circles": "径向布局"
+    },
     "zoomIn": "放大",
     "zoomOut": "缩小",
     "fit": "适应屏幕",
@@ -122,7 +129,16 @@
     "runLayout": "重新运行布局",
     "layoutOptimizing": "正在优化布局...",
     "turnOffHighlights": "关闭全部高亮",
-    "turnOnHighlights": "开启 AI 高亮"
+    "turnOnHighlights": "开启 AI 高亮",
+    "chatOnly": {
+      "title": "图谱未加载",
+      "description": "这是一个大型项目，已跳过图谱加载以保持浏览器响应。AI 对话功能正常可用。",
+      "descriptionWithCount": "该项目包含 {{count}} 个节点，已跳过图谱加载以保持浏览器响应。AI 对话功能正常可用。",
+      "citationNote": "图谱未加载时，对话中的内联文件引用不会自动在代码面板中打开。",
+      "loadAnyway": "仍然加载图谱",
+      "loadAnywayWarning": "该项目包含 {{count}} 个节点。加载完整图谱可能导致浏览器变慢或无响应。是否继续？",
+      "loadAnywayWarningUnknown": "这可能是一个大型项目。加载完整图谱可能导致浏览器变慢或无响应。是否继续？"
+    }
   },
   "processes": {
     "unknownStep": "未知",

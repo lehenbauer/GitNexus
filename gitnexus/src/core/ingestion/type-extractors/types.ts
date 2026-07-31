@@ -32,7 +32,7 @@ export type ConstructorBindingScanner = (
 
 /** Infer the type name of a literal AST node for overload disambiguation.
  *  Returns the canonical type name (e.g. 'int', 'String', 'boolean') or undefined
- *  for non-literal nodes. Only used when resolveCallTarget has multiple candidates
+ *  for non-literal nodes. Only used when the call resolver has multiple candidates
  *  with parameterTypes — ~1-3% of call sites. */
 export type LiteralTypeInferrer = (node: SyntaxNode) => string | undefined;
 
@@ -142,6 +142,18 @@ export interface LanguageTypeConfig {
   readonly allowPatternBindingOverwrite?: boolean;
   /** Node types that represent typed declarations for this language */
   declarationNodeTypes: ReadonlySet<string>;
+  /** Function node types that OWN their `this` receiver, terminating the
+   *  upward AST walk that resolves `this`/`self`/`$this` to an enclosing
+   *  class. The type-env twin of `Scope.ownsReceivers` (#2701): the scope
+   *  layer gates receiver-type LOOKUP, this gates receiver-type INFERENCE
+   *  during capture, and a call is only suppressed when both agree.
+   *
+   *  Most languages leave it unset — their closures capture the enclosing
+   *  `this` lexically (Kotlin lambdas, Go func literals, C# lambdas, Dart
+   *  function expressions, PHP closures auto-bound since 5.4, Python's
+   *  `self` closed over by a nested `def`) — so the walk is unchanged
+   *  there. JavaScript/TypeScript are the exception. */
+  thisBoundaryNodeTypes?: ReadonlySet<string>;
   /** Optional: language-specific way to find a declaration's type-annotation node.
    * Prefer providing this for grammars where the type is wrapped (e.g., C#, Kotlin, Swift). */
   getDeclarationTypeNode?: DeclarationTypeNodeLocator;

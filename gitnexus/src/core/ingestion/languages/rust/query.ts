@@ -8,7 +8,9 @@ const RUST_SCOPE_QUERY = `
 (trait_item) @scope.class
 (impl_item) @scope.class
 (enum_item) @scope.class
+(union_item) @scope.class
 (function_item) @scope.function
+(function_signature_item) @scope.function
 (closure_expression) @scope.function
 (block) @scope.block
 (if_expression) @scope.block
@@ -30,9 +32,62 @@ const RUST_SCOPE_QUERY = `
 (enum_item
   name: (type_identifier) @declaration.name) @declaration.enum
 
+;; Declarations — union
+;; Deliberately tagged @declaration.struct (→ Struct label), NOT a
+;; @declaration.union: every registry-primary resolution gate —
+;; isLinkableLabel (node-lookup.ts), CALLABLE_OR_TYPE_LIKE
+;; (finalize-algorithm.ts), ClassLikeNodeLabel (class-types.ts) — includes
+;; Struct but EXCLUDES Union, so a Union-labeled node would be an
+;; unresolvable orphan. A Rust union is a type whose literal is a real
+;; constructor, so Struct is both the resolvable and the semantically
+;; honest label here. #1934 F71.
+(union_item
+  name: (type_identifier) @declaration.name) @declaration.struct
+
+;; Declarations — module (mod foo { ... } / mod foo;)
+;; A Rust mod is an ITEM, not just a lexical region: rustc resolves the first
+;; segment of a path (inner::dispatch) against the module tree in the TYPE
+;; namespace, which is why a same-named fn can never shadow it. Capturing the
+;; module as a named DEF (not only the @scope.namespace region above) is what
+;; makes that tree addressable — it feeds the shared tagNamespacePrefixes pass
+;; so members carry inner / a.b as their namespacePrefix, which qualified
+;; call resolution then matches against the written path (#2730). Mirrors the
+;; C++ namespace_definition capture.
+(mod_item
+  name: (identifier) @declaration.name) @declaration.namespace
+
+;; Declarations — macro (macro_rules! foo { ... })
+;; Captured as @declaration.macro → Macro label. A macro invocation
+;; (@reference.macro, below) resolves to this definition via MacroRegistry,
+;; whose acceptedKinds is ['Macro'] ONLY — so an invoked macro never binds
+;; to a same-named free function (log!() is not fn log). #1934 F72.
+(macro_definition
+  name: (identifier) @declaration.name) @declaration.macro
+
 ;; Declarations — function (top-level or inside mod)
 (function_item
   name: (identifier) @declaration.name) @declaration.function
+
+;; Declarations — trait method signature (required method, no body,
+;; e.g. fn foo(self) -> T; inside a trait body). Without this, an abstract
+;; trait method is invisible to scope resolution — never owned by its
+;; trait's Class scope, so a dyn Trait receiver can never dispatch to
+;; it (#2604).
+(function_signature_item
+  name: (identifier) @declaration.name) @declaration.function
+
+;; Declarations — closure bound to a let: let handler = || target(1);
+;; Anchor discipline (same contract as javascript/query.ts): @declaration.function
+;; sits on the INNER closure_expression, NOT on the let_declaration wrapper, so
+;; anchor.range aligns with the (closure_expression) @scope.function range above.
+;; pass2AttachDeclarations then attaches the declaration to the CLOSURE's own
+;; scope instead of the enclosing block, which is what lets pickCallerCallableDef
+;; treat the closure as a call SOURCE rather than falling through to the
+;; enclosing fn (#2699). Also covers move closures — the closure_expression
+;; node spans the move keyword.
+(let_declaration
+  pattern: (identifier) @declaration.name
+  value: (closure_expression) @declaration.function)
 
 ;; Declarations — struct fields
 (field_declaration
@@ -40,6 +95,10 @@ const RUST_SCOPE_QUERY = `
   type: (_) @declaration.field-type) @declaration.field
 
 ;; Declarations — variables (let bindings)
+;; Uses pattern:(identifier) — works for let x and let mut x (mutable_specifier
+;; is a sibling, not a wrapper). Destructuring patterns like let (a, b) use
+;; tuple_pattern etc. which pattern:(identifier) intentionally does not match;
+;; capturing them with (_) would produce "(a, b)" as the name, which is useless.
 (let_declaration
   pattern: (identifier) @declaration.name) @declaration.variable
 
@@ -103,14 +162,56 @@ const RUST_SCOPE_QUERY = `
     value: (_) @reference.receiver
     field: (field_identifier) @reference.name)) @reference.call.member
 
-;; References — scoped calls (Foo::bar())
+;; References — scoped calls (Foo::bar(), tools::dispatch())
+;; The call stays a FREE call (resolution is the lexical scope chain), but the
+;; written path is carried along as @reference.qualified-name so a module-
+;; qualified call can be resolved against the module the qualifier names before
+;; the scope-chain walk binds it to a same-named local shadow (#2730).
 (call_expression
   function: (scoped_identifier
-    name: (identifier) @reference.name)) @reference.call.free
+    name: (identifier) @reference.name) @reference.qualified-name) @reference.call.free
 
 ;; References — constructor calls (struct literal)
+;; tree-sitter-rust gives struct_expression.name one of three node types
+;; (type_identifier | scoped_type_identifier | generic_type_with_turbofish);
+;; the turbofish form additionally nests either a type_identifier or a
+;; scoped_identifier. We enumerate all four shapes below so the capture is
+;; always the trailing identifier (resolved scope-aware), not the full path:
+;;   bare              Foo {}
+;;   scoped            foo::bar::Baz {}
+;;   turbofish         Foo::<T> {}
+;;   scoped+turbofish  foo::Bar::<T> {}
 (struct_expression
-  name: (_) @reference.name) @reference.call.constructor
+  name: (type_identifier) @reference.name) @reference.call.constructor
+
+;; Scoped struct (foo::bar::Baz {})
+(struct_expression
+  name: (scoped_type_identifier
+    name: (type_identifier) @reference.name)) @reference.call.constructor
+
+;; Turbofish struct (Foo::<T> {})
+(struct_expression
+  name: (generic_type_with_turbofish
+    type: (type_identifier) @reference.name)) @reference.call.constructor
+
+;; Scoped + turbofish struct (foo::Bar::<T> {}) — the turbofish wraps a
+;; scoped_identifier whose tail is an identifier (not a type_identifier).
+(struct_expression
+  name: (generic_type_with_turbofish
+    type: (scoped_identifier
+      name: (identifier) @reference.name))) @reference.call.constructor
+
+;; References — macro invocations (disjoint namespace from functions)
+;; Resolved via MacroRegistry → Macro defs only (never fn of the same name).
+(macro_invocation
+  macro: (identifier) @reference.name) @reference.macro
+
+;; Scoped macro invocation (log::info!(…)) — capture the tail identifier,
+;; mirroring the scoped free-call pattern above, so the resolved name is
+;; the tail (info), not the full path (log::info).
+(macro_invocation
+  macro: (scoped_identifier
+    name: (identifier) @reference.name)) @reference.macro
 
 ;; References — field reads
 (field_expression

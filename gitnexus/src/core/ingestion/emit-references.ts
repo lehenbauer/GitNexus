@@ -57,6 +57,7 @@ import type {
 } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../graph/types.js';
 import type { ScopeResolutionIndexes } from './model/scope-resolution-indexes.js';
+import { toZeroBasedLine } from './utils/line-base.js';
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
@@ -140,8 +141,8 @@ export function emitScopeGraph(input: {
       properties: {
         name: scope.kind,
         filePath: scope.filePath,
-        startLine: scope.range.startLine,
-        endLine: scope.range.endLine,
+        startLine: toZeroBasedLine(scope.range.startLine),
+        endLine: toZeroBasedLine(scope.range.endLine),
         description: `Scope: ${scope.kind}`,
       } as unknown as Parameters<KnowledgeGraph['addNode']>[0]['properties'],
     });
@@ -267,9 +268,14 @@ function buildRelationship(
 
 /**
  * Map a `Reference.kind` to an existing `RelationshipType`. Read/write
- * both fold into `ACCESSES`; `type-reference` + `import-use` both fold
- * into `USES`. This keeps the graph schema additive — no new
+ * both fold into `ACCESSES`; `type-reference`, `import-use`, and `macro`
+ * all fold into `USES`. This keeps the graph schema additive — no new
  * RelationshipType values are introduced by this module.
+ *
+ * `macro` folds into `USES` (not `CALLS`) deliberately: a macro
+ * invocation targets a `Macro` node, not a callable function, so keeping
+ * it out of the `CALLS` keyspace preserves the invariant that `CALLS`
+ * edges denote function/method dispatch.
  */
 function mapKindToType(kind: Reference['kind']): RelationshipType {
   switch (kind) {
@@ -282,6 +288,11 @@ function mapKindToType(kind: Reference['kind']): RelationshipType {
       return 'INHERITS';
     case 'type-reference':
     case 'import-use':
+    case 'macro':
+    // value-ref: function registered as an object-literal property value —
+    // a reference, not an invocation; CALLS are synthesized separately by
+    // the property-dispatch pass (#2437).
+    case 'value-ref':
       return 'USES';
   }
 }

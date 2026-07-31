@@ -8,8 +8,8 @@ Static config that adds GitNexus knowledge-graph augmentation and skill files to
 
 | Layer                     | What it does                                                                                                                              | How it's installed                                                              |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| **MCP**                   | `gitnexus` MCP server with 16 tools (`query`, `context`, `impact`, `detect_changes`, `rename`, …)                                         | `npx gitnexus setup` writes `~/.cursor/mcp.json` automatically.                 |
-| **Skills**                | `/gitnexus-exploring`, `/gitnexus-debugging`, `/gitnexus-impact-analysis`, `/gitnexus-refactoring`, `/gitnexus-pr-review` markdown skills | `npx gitnexus setup` copies them to `~/.cursor/skills/gitnexus/`.               |
+| **MCP**                   | `gitnexus` MCP server with 17 tools (`query`, `context`, `impact`, `detect_changes`, `rename`, …)                                         | `npx gitnexus setup` writes `~/.cursor/mcp.json` automatically.                 |
+| **Skills**                | All bundled markdown skills (`/gitnexus-exploring`, `/gitnexus-debugging`, `/gitnexus-impact-analysis`, `/gitnexus-refactoring`, `/gitnexus-guide`, `/gitnexus-cli`, `/gitnexus-review`, `/gitnexus-plan`, `/gitnexus-work`, `/gitnexus-lfg`, `/gitnexus-pdg-query`, `/gitnexus-taint-analysis`) | `npx gitnexus setup` copies them to `~/.cursor/skills/gitnexus/`.               |
 | **Hooks** _(this README)_ | `postToolUse` hook that enriches `Shell` / `Read` / `Grep` tool calls with graph context — same augmentation Claude Code gets             | **Manual** — copy the files described below into your project's `.cursor/`. |
 
 ## Hook install
@@ -40,7 +40,7 @@ If you already have a `.cursor/hooks.json`, merge the `hooks.postToolUse` array 
 
 ### Verify
 
-1. Index the project: `npx gitnexus analyze`
+1. Index the project: `npx gitnexus analyze` (on npm 11.x, `npx` can crash during install — use `pnpm --allow-build=@ladybugdb/core --allow-build=gitnexus --allow-build=tree-sitter dlx gitnexus@latest analyze` instead; see [#1939](https://github.com/abhigyanpatwari/GitNexus/issues/1939))
 2. Reload the Cursor window so it picks up the new hook config.
 3. Ask the agent something that triggers `Read` / `Grep` / `Shell rg`. You should see a `[GitNexus]` block appended to the tool result.
 4. Diagnose silent no-ops by setting `GITNEXUS_DEBUG=1` in your shell environment — the hook will write Cursor's raw event payload to stderr so you can verify field names.

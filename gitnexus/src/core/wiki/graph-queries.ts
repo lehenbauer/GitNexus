@@ -5,7 +5,8 @@
  * Uses the MCP-style pooled lbug-adapter for connection management.
  */
 
-import { initLbug, executeQuery, closeLbug, touchRepo } from '../lbug/pool-adapter.js';
+import { initLbug, executeQuery, closeLbug, touchRepo, pinRepo } from '../lbug/pool-adapter.js';
+import { escapeCypherString } from '../lbug/cypher-escape.js';
 
 const REPO_ID = '__wiki__';
 
@@ -14,6 +15,15 @@ const REPO_ID = '__wiki__';
  */
 export function touchWikiDb(): void {
   touchRepo(REPO_ID);
+}
+
+/**
+ * Keep the wiki DB resident for a full generation run. Wiki generation can spend
+ * minutes inside LLM calls, and the pooled DB must survive both idle cleanup and
+ * unrelated LRU pressure until the run reaches its final graph queries.
+ */
+export function pinWikiDb(): () => void {
+  return pinRepo(REPO_ID);
 }
 
 export interface FileWithExports {
@@ -57,6 +67,9 @@ export async function closeWikiDb(): Promise<void> {
 
 /**
  * Get all source files with their exported symbol names and types.
+ * Includes top-level exports (File→DEFINES→n) and exported class members
+ * (File→DEFINES→Class→HAS_METHOD/HAS_PROPERTY→n) since class members no
+ * longer have a direct File→DEFINES edge.
  */
 export async function getFilesWithExports(): Promise<FileWithExports[]> {
   const rows = await executeQuery(
@@ -65,7 +78,12 @@ export async function getFilesWithExports(): Promise<FileWithExports[]> {
     MATCH (f:File)-[:CodeRelation {type: 'DEFINES'}]->(n)
     WHERE n.isExported = true
     RETURN f.filePath AS filePath, n.name AS name, labels(n)[0] AS type
-    ORDER BY f.filePath
+    UNION
+    MATCH (f:File)-[:CodeRelation {type: 'DEFINES'}]->(c)
+          -[mr:CodeRelation]->(n)
+    WHERE mr.type IN ['HAS_METHOD', 'HAS_PROPERTY'] AND n.isExported = true
+    RETURN f.filePath AS filePath, n.name AS name, labels(n)[0] AS type
+    ORDER BY filePath
   `,
   );
 
@@ -129,7 +147,7 @@ export async function getInterFileCallEdges(): Promise<CallEdge[]> {
 export async function getIntraModuleCallEdges(filePaths: string[]): Promise<CallEdge[]> {
   if (filePaths.length === 0) return [];
 
-  const fileList = filePaths.map((f) => `'${f.replace(/'/g, "''")}'`).join(', ');
+  const fileList = filePaths.map((f) => `'${escapeCypherString(f)}'`).join(', ');
   const rows = await executeQuery(
     REPO_ID,
     `
@@ -157,7 +175,7 @@ export async function getInterModuleCallEdges(filePaths: string[]): Promise<{
 }> {
   if (filePaths.length === 0) return { outgoing: [], incoming: [] };
 
-  const fileList = filePaths.map((f) => `'${f.replace(/'/g, "''")}'`).join(', ');
+  const fileList = filePaths.map((f) => `'${escapeCypherString(f)}'`).join(', ');
 
   const outRows = await executeQuery(
     REPO_ID,
@@ -204,7 +222,7 @@ export async function getInterModuleCallEdges(filePaths: string[]): Promise<{
 export async function getProcessesForFiles(filePaths: string[], limit = 5): Promise<ProcessInfo[]> {
   if (filePaths.length === 0) return [];
 
-  const fileList = filePaths.map((f) => `'${f.replace(/'/g, "''")}'`).join(', ');
+  const fileList = filePaths.map((f) => `'${escapeCypherString(f)}'`).join(', ');
 
   // Find processes that have steps in the given files
   const procRows = await executeQuery(
@@ -230,7 +248,7 @@ export async function getProcessesForFiles(filePaths: string[], limit = 5): Prom
     const stepRows = await executeQuery(
       REPO_ID,
       `
-      MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${procId.replace(/'/g, "''")}'})
+      MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${escapeCypherString(procId)}'})
       RETURN s.name AS name, s.filePath AS filePath, labels(s)[0] AS type, r.step AS step
       ORDER BY r.step
     `,
@@ -278,7 +296,7 @@ export async function getAllProcesses(limit = 20): Promise<ProcessInfo[]> {
     const stepRows = await executeQuery(
       REPO_ID,
       `
-      MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${procId.replace(/'/g, "''")}'})
+      MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process {id: '${escapeCypherString(procId)}'})
       RETURN s.name AS name, s.filePath AS filePath, labels(s)[0] AS type, r.step AS step
       ORDER BY r.step
     `,

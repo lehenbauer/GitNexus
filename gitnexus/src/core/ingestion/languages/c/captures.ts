@@ -1,6 +1,6 @@
 import type { Capture, CaptureMatch } from 'gitnexus-shared';
 import {
-  findNodeAtRange,
+  nodeIfType,
   nodeToCapture,
   syntheticCapture,
   type SyntaxNode,
@@ -11,6 +11,27 @@ import { parseSourceSafe } from '../../../tree-sitter/safe-parse.js';
 import { splitCInclude } from './import-decomposer.js';
 import { computeCDeclarationArity, computeCCallArity } from './arity-metadata.js';
 import { markStaticName } from './static-linkage.js';
+import { synthesizeReceiverChainCapture } from '../../utils/receiver-chain-captures.js';
+import {
+  synthesizeCallableFlowCaptures,
+  type CallableCaptureSignature,
+} from '../../utils/callable-flow-captures.js';
+
+const C_CALLABLE_CAPTURE_OPTIONS = {
+  functionNodeTypes: new Set(['function_definition']),
+  callNodeTypes: new Set(['call_expression']),
+  parameterListNodeTypes: new Set(['parameter_list', 'argument_list']),
+  parameterNodeTypes: new Set(['parameter_declaration']),
+  bindingNodeTypes: new Set(['init_declarator']),
+  assignmentNodeTypes: new Set(['assignment_expression']),
+  identifierNodeTypes: new Set(['identifier', 'field_identifier', 'type_identifier']),
+  callableSignatureDeclarationNodeTypes: new Set(['declaration', 'parameter_declaration']),
+  emitCanonicalInvokeReference: true,
+  parameterPassingMode: (parameter: SyntaxNode) =>
+    containsNodeType(parameter, 'pointer_declarator') ? ('pointer' as const) : ('value' as const),
+  expectedSignature: (container: SyntaxNode, destination: SyntaxNode) =>
+    functionDeclaratorSignature(destination) ?? functionDeclaratorSignature(container),
+} as const;
 
 export function emitCScopeCaptures(
   sourceText: string,
@@ -27,23 +48,36 @@ export function emitCScopeCaptures(
   const rawMatches = getCScopeQuery().matches(tree.rootNode);
   const out: CaptureMatch[] = [];
 
-  // Track ranges where typedef-struct/union was captured as @declaration.struct/union
-  // so we can suppress the duplicate @declaration.typedef match at the same range.
-  const structTypedefRanges = new Set<string>();
+  // Track ranges where typedef-struct/union/enum was captured as its concrete
+  // type so we can suppress the duplicate @declaration.typedef match.
+  const concreteTypedefRanges = new Set<string>();
 
   for (const m of rawMatches) {
     const grouped: Record<string, Capture> = {};
+    // Parallel tag -> captured SyntaxNode map. The tree-sitter query already
+    // hands us each matched node as `c.node`, so anchors resolve via a
+    // type-guarded lookup (`nodeIfType`) instead of re-deriving them with
+    // `findNodeAtRange(tree.rootNode, ...)` per match — the
+    // O(matches × rootChildren) root-walk fixed for go #1848 / python #1918 /
+    // rust/csharp #1915 / java #1951, mirrored here for C. Every C scope-query
+    // anchor below captures directly ON the node the old root-walk re-derived
+    // (verified against C_SCOPE_QUERY in query.ts: @import.statement on
+    // preproc_include, @declaration.function on function_definition/declaration,
+    // @reference.call.free/.member on call_expression), so the type check is
+    // exact. C has no inheritance construct, so there is no heritage synthesis.
+    const nodeMap: Record<string, SyntaxNode> = {};
     for (const c of m.captures) {
       const tag = '@' + c.name;
       if (tag.startsWith('@_')) continue;
       grouped[tag] = nodeToCapture(tag, c.node);
+      nodeMap[tag] = c.node;
     }
     if (Object.keys(grouped).length === 0) continue;
 
-    // Handle #include statements
+    // Handle #include statements. `@import.statement` is captured directly on
+    // the `preproc_include` node.
     if (grouped['@import.statement'] !== undefined) {
-      const anchor = grouped['@import.statement']!;
-      const includeNode = findNodeAtRange(tree.rootNode, anchor.range, 'preproc_include');
+      const includeNode = nodeIfType(nodeMap['@import.statement'], 'preproc_include');
       if (includeNode !== null) {
         const split = splitCInclude(includeNode);
         if (split !== null) {
@@ -53,27 +87,34 @@ export function emitCScopeCaptures(
       }
     }
 
-    // Track typedef-struct ranges to suppress duplicate typedef declarations
-    const structAnchor = grouped['@declaration.struct'] ?? grouped['@declaration.union'];
-    if (structAnchor !== undefined) {
-      const r = structAnchor.range;
-      structTypedefRanges.add(`${r.startLine}:${r.startCol}:${r.endLine}:${r.endCol}`);
+    // Track typedef struct/union/enum ranges to suppress duplicate typedef declarations
+    const concreteTypeAnchor =
+      grouped['@declaration.struct'] ??
+      grouped['@declaration.union'] ??
+      grouped['@declaration.enum'];
+    if (concreteTypeAnchor !== undefined) {
+      const r = concreteTypeAnchor.range;
+      concreteTypedefRanges.add(`${r.startLine}:${r.startCol}:${r.endLine}:${r.endCol}`);
     }
 
-    // Suppress @declaration.typedef if the same range was already captured as struct/union
+    // Suppress @declaration.typedef if the same range was already captured as a concrete type.
     const typedefAnchor = grouped['@declaration.typedef'];
     if (typedefAnchor !== undefined) {
       const r = typedefAnchor.range;
       const key = `${r.startLine}:${r.startCol}:${r.endLine}:${r.endCol}`;
-      if (structTypedefRanges.has(key)) continue;
+      if (concreteTypedefRanges.has(key)) continue;
     }
 
-    // Enrich function declarations with arity metadata and detect static linkage
-    const declAnchor = grouped['@declaration.function'];
-    if (declAnchor !== undefined) {
-      const fnNode =
-        findNodeAtRange(tree.rootNode, declAnchor.range, 'function_definition') ??
-        findNodeAtRange(tree.rootNode, declAnchor.range, 'declaration');
+    // Enrich function declarations with arity metadata and detect static linkage.
+    // `@declaration.function` is captured directly on the `function_definition`
+    // node (definitions) or the `declaration` node (prototypes) — the captured
+    // node IS what the old findNodeAtRange re-derived.
+    if (grouped['@declaration.function'] !== undefined) {
+      const fnNode = nodeIfType(
+        nodeMap['@declaration.function'],
+        'function_definition',
+        'declaration',
+      );
       if (fnNode !== null) {
         const arity = computeCDeclarationArity(fnNode);
         if (arity.parameterCount !== undefined) {
@@ -108,10 +149,12 @@ export function emitCScopeCaptures(
       }
     }
 
-    // Enrich call references with arity
-    const callAnchor = grouped['@reference.call.free'] ?? grouped['@reference.call.member'];
-    if (callAnchor !== undefined && grouped['@reference.arity'] === undefined) {
-      const callNode = findNodeAtRange(tree.rootNode, callAnchor.range, 'call_expression');
+    // Enrich call references with arity. @reference.call.free / .member are both
+    // captured directly on the `call_expression` node — the captured node IS
+    // what the old findNodeAtRange re-derived.
+    const callAnchorNode = nodeMap['@reference.call.free'] ?? nodeMap['@reference.call.member'];
+    if (callAnchorNode !== undefined && grouped['@reference.arity'] === undefined) {
+      const callNode = nodeIfType(callAnchorNode, 'call_expression');
       if (callNode !== null) {
         grouped['@reference.arity'] = syntheticCapture(
           '@reference.arity',
@@ -121,10 +164,63 @@ export function emitCScopeCaptures(
       }
     }
 
+    // Structural receiver chain for a call whose receiver is itself an
+    // expression, so resolution can type it by folding over structure
+    // instead of re-parsing the receiver's source text. Self-gating: a
+    // non-call match, an absent receiver, or a chain with no nameable base
+    // all leave `grouped` untouched.
+    synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
     out.push(grouped);
   }
 
+  out.push(...synthesizeCallableFlowCaptures(tree.rootNode, C_CALLABLE_CAPTURE_OPTIONS));
   return out;
+}
+
+function functionDeclaratorSignature(node: SyntaxNode): CallableCaptureSignature | undefined {
+  const declarator = findDescendantOfType(node, 'function_declarator');
+  const parameters = declarator?.childForFieldName('parameters');
+  if (parameters === null || parameters === undefined) return undefined;
+  const parameterNodes = parameters.namedChildren.filter(
+    (child): child is SyntaxNode => child !== null && child.type === 'parameter_declaration',
+  );
+  // tree-sitter-c materializes `...` as a NAMED `variadic_parameter` node —
+  // the anonymous-token checks never matched, so variadic signatures were
+  // emitted with a wrong fixed arity (#2522 review). Keep the token checks
+  // for grammar variants that expose `...` as an anonymous literal.
+  const hasEllipsis = parameters.children.some(
+    (child) =>
+      child.type === 'variadic_parameter' ||
+      child.type === '...' ||
+      (!child.isNamed && child.text === '...'),
+  );
+  const isVoidOnly =
+    parameterNodes.length === 1 &&
+    parameterNodes[0]!.namedChildCount === 1 &&
+    parameterNodes[0]!.firstNamedChild?.text === 'void';
+  if (isVoidOnly) return { parameterCount: 0, parameterTypes: [] };
+  const parameterTypes = parameterNodes.map(
+    (parameter) => parameter.childForFieldName('type')?.text ?? 'unknown',
+  );
+  if (hasEllipsis) parameterTypes.push('...');
+  return {
+    ...(hasEllipsis ? {} : { parameterCount: parameterNodes.length }),
+    parameterTypes,
+  };
+}
+
+function containsNodeType(root: SyntaxNode, type: string): boolean {
+  return findDescendantOfType(root, type) !== null;
+}
+
+function findDescendantOfType(root: SyntaxNode, type: string): SyntaxNode | null {
+  const stack: SyntaxNode[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (node.type === type) return node;
+    for (const child of node.namedChildren) if (child !== null) stack.push(child);
+  }
+  return null;
 }
 
 /**

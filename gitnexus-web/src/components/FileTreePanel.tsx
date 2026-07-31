@@ -201,7 +201,10 @@ const getNodeTypeIcon = (label: NodeLabel) => {
     case 'Import':
       return FileCode;
     case 'Variable':
+    case 'Property':
       return Variable;
+    case 'Const':
+      return Target;
     default:
       return Variable;
   }
@@ -386,7 +389,7 @@ export const FileTreePanel = ({ onFocusNode }: FileTreePanelProps) => {
           </div>
 
           {/* File tree */}
-          <div className="scrollbar-thin flex-1 overflow-y-auto py-2">
+          <div className="flex-1 scrollbar-thin overflow-y-auto py-2">
             {fileTree.length === 0 ? (
               <div className="px-3 py-4 text-center text-xs text-text-muted">
                 {t('graph:fileTree.noFilesLoaded')}
@@ -410,7 +413,7 @@ export const FileTreePanel = ({ onFocusNode }: FileTreePanelProps) => {
       )}
 
       {activeTab === 'filters' && (
-        <div className="scrollbar-thin flex-1 overflow-y-auto p-3">
+        <div className="flex-1 scrollbar-thin overflow-y-auto p-3">
           <div className="mb-3">
             <h3 className="mb-2 text-xs font-medium tracking-wide text-text-secondary uppercase">
               {t('graph:fileTree.nodeTypes')}

@@ -2,14 +2,8 @@
  * Java `ScopeResolver` registered in `SCOPE_RESOLVERS` and consumed by
  * the generic `runScopeResolution` orchestrator (RFC #909 Ring 3).
  *
- * ## Registry-primary parity status
- *
- * Java is in `MIGRATED_LANGUAGES` — the scope-resolution registry is
- * the primary call-resolution path.  Parity: 178/178 (100%).
- *
- * **CI visibility:** The parity CI workflow (`ci-scope-parity.yml`)
- * runs Java tests in both `REGISTRY_PRIMARY_JAVA=0` and `=1` modes
- * automatically.
+ * Java resolves via the scope-resolution registry — the sole
+ * call-resolution path.
  */
 
 import type { ParsedFile, TypeRef } from 'gitnexus-shared';
@@ -35,11 +29,29 @@ import {
   type JavaResolveContext,
 } from './index.js';
 import { populateJavaPackageSiblings } from './package-siblings.js';
+import { attachSpringBeanCandidateMetadata } from './spring-bean-metadata.js';
+import { attachJavaSpringConfigBindings } from './spring-config-bindings.js';
+import { attachJavaSpringConditionalMetadata } from './spring-conditionals.js';
+import { attachJavaSpringDiMetadata } from './spring-di.js';
+import {
+  applyJavaCaptureSideChannel,
+  clearJavaClassAnnotationFacts,
+} from './capture-side-channel.js';
+import { clearJavaPackageFacts } from './package-facts.js';
 
 const javaScopeResolver: ScopeResolver = {
   language: SupportedLanguages.Java,
   languageProvider: javaProvider,
   importEdgeReason: 'java-scope: import',
+
+  loadResolutionConfig: () => {
+    // Worker capture facts are process-local and outlive a single analysis in
+    // server mode. This hook runs once before each Java workspace pass, before
+    // ParsedFile side channels are restored for the current files.
+    clearJavaClassAnnotationFacts();
+    clearJavaPackageFacts();
+    return undefined;
+  },
 
   resolveImportTarget: (targetRaw, fromFile, allFilePaths) => {
     const ws: JavaResolveContext = { fromFile, allFilePaths };
@@ -56,6 +68,7 @@ const javaScopeResolver: ScopeResolver = {
   buildMro: buildJavaMro,
 
   populateOwners: (parsed: ParsedFile) => populateClassOwnedMembers(parsed),
+  applyCaptureSideChannel: applyJavaCaptureSideChannel,
 
   isSuperReceiver: (text) => text.trim() === 'super',
 
@@ -63,9 +76,22 @@ const javaScopeResolver: ScopeResolver = {
   propagatesReturnTypesAcrossImports: true,
   collapseMemberCallsByCallerTarget: true,
   hoistTypeBindingsToModule: true,
+  stripReceiverCastExpressions: true,
+  // #2550: every Java method belongs to a class instance — a free call may
+  // resolve to a Method only when the caller's enclosing class chain
+  // (self + MRO) contains the method's owner. Closes the finalize-bucket
+  // leak (unqualified `run()` matching an unrelated same-file anonymous
+  // class's method). C# is the intended next adopter.
+  freeCallsRequireInstanceOwnership: true,
 
   populateNamespaceSiblings: populateJavaPackageSiblings,
   populateRangeBindings: populateJavaCrossFileReturnTypes,
+  emitPostResolutionEdges: (graph, parsedFiles, nodeLookup, indexes, ctx) => {
+    attachSpringBeanCandidateMetadata(graph, parsedFiles, nodeLookup, indexes);
+    attachJavaSpringConditionalMetadata(graph, parsedFiles, nodeLookup, indexes);
+    attachJavaSpringDiMetadata(graph, parsedFiles, nodeLookup, indexes);
+    attachJavaSpringConfigBindings(graph, parsedFiles, nodeLookup, indexes, ctx);
+  },
 };
 
 export { javaScopeResolver };

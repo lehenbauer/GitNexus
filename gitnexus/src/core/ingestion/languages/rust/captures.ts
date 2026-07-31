@@ -1,8 +1,9 @@
 import type { Capture, CaptureMatch } from 'gitnexus-shared';
 import {
-  findNodeAtRange,
+  nodeIfType,
   nodeToCapture,
   syntheticCapture,
+  walkNamedTree,
   type SyntaxNode,
 } from '../../utils/ast-helpers.js';
 import { getRustParser, getRustScopeQuery } from './query.js';
@@ -11,6 +12,20 @@ import { splitRustUseDeclaration } from './import-decomposer.js';
 import { synthesizeRustReceiverBinding } from './receiver-binding.js';
 import { getTreeSitterBufferSize } from '../../constants.js';
 import { parseSourceSafe } from '../../../tree-sitter/safe-parse.js';
+import { synthesizeCallableFlowCaptures } from '../../utils/callable-flow-captures.js';
+import { synthesizeReceiverChainCapture } from '../../utils/receiver-chain-captures.js';
+
+const RUST_CALLABLE_CAPTURE_OPTIONS = {
+  functionNodeTypes: new Set(['function_item', 'closure_expression']),
+  callNodeTypes: new Set(['call_expression']),
+  parameterListNodeTypes: new Set(['parameters', 'arguments']),
+  parameterNodeTypes: new Set(['parameter', 'self_parameter']),
+  bindingNodeTypes: new Set(['let_declaration']),
+  assignmentNodeTypes: new Set(['assignment_expression']),
+  identifierNodeTypes: new Set(['identifier', 'type_identifier', 'field_identifier']),
+  callableReferenceNodeTypes: new Set(['scoped_identifier']),
+  normalizeQualifiedName: (raw: string) => raw.replaceAll('::', '.'),
+} as const;
 
 export function emitRustScopeCaptures(
   sourceText: string,
@@ -32,17 +47,23 @@ export function emitRustScopeCaptures(
 
   for (const m of rawMatches) {
     const grouped: Record<string, Capture> = {};
+    // Parallel tag -> captured SyntaxNode map: the query hands us each matched
+    // node as c.node, so anchors resolve via a type-guarded lookup (nodeIfType)
+    // instead of re-deriving them with findNodeAtRange(tree.rootNode, ...) per
+    // match — the O(matches x rootChildren) root-walk fixed for go #1915 /
+    // python #1918, mirrored here.
+    const nodeMap: Record<string, SyntaxNode> = {};
     for (const c of m.captures) {
       const tag = '@' + c.name;
       if (tag.startsWith('@_')) continue;
       grouped[tag] = nodeToCapture(tag, c.node);
+      nodeMap[tag] = c.node;
     }
     if (Object.keys(grouped).length === 0) continue;
 
     // Decompose use declarations into individual import captures
     if (grouped['@import.statement'] !== undefined) {
-      const anchor = grouped['@import.statement']!;
-      const useNode = findNodeAtRange(tree.rootNode, anchor.range, 'use_declaration');
+      const useNode = nodeIfType(nodeMap['@import.statement'], 'use_declaration');
       if (useNode !== null) {
         out.push(...splitRustUseDeclaration(useNode));
         continue;
@@ -52,8 +73,7 @@ export function emitRustScopeCaptures(
     // Synthesize self receiver bindings for methods inside impl blocks
     let cachedImplLookup: { fnNode: SyntaxNode; implNode: SyntaxNode | null } | undefined;
     if (grouped['@scope.function'] !== undefined) {
-      const scopeCap = grouped['@scope.function']!;
-      const fnNode = findNodeAtRange(tree.rootNode, scopeCap.range, 'function_item');
+      const fnNode = nodeIfType(nodeMap['@scope.function'], 'function_item');
       if (fnNode !== null) {
         const implNode = findEnclosingImpl(fnNode);
         cachedImplLookup = { fnNode, implNode };
@@ -65,7 +85,7 @@ export function emitRustScopeCaptures(
     // Attach declaration arity for functions/methods
     const declAnchor = grouped['@declaration.function'];
     if (declAnchor !== undefined) {
-      const fnNode = findNodeAtRange(tree.rootNode, declAnchor.range, 'function_item');
+      const fnNode = nodeIfType(nodeMap['@declaration.function'], 'function_item');
       if (fnNode !== null) {
         const implNode =
           cachedImplLookup?.fnNode === fnNode
@@ -104,6 +124,31 @@ export function emitRustScopeCaptures(
       }
     }
 
+    // `Self` in a type binding names the enclosing impl's type, not a type
+    // called "Self". `let fresh = Self { … }` inside `impl User` binds
+    // `fresh: User`; recorded verbatim it binds `fresh: Self`, which resolves
+    // to nothing and leaves the receiver's type unknown.
+    //
+    // The type-env channel already substitutes this
+    // (`type-extractors/rust.ts` → `findEnclosingImplType`); the
+    // scope-resolution channel did not, so the two disagreed. That went
+    // unnoticed while `lookupCore` Step 1 still walked the lexical chain for
+    // named receivers — the impl scope binds the method by name, so
+    // `fresh.validate()` resolved by accident. #2714 stopped that walk for
+    // named receivers and the gap became a lost edge (#2699 follow-up).
+    const tbTypeNode = nodeMap['@type-binding.type'];
+    if (grouped['@type-binding.type']?.text === 'Self' && tbTypeNode !== undefined) {
+      const implNode = findEnclosingImpl(tbTypeNode);
+      const implTypeNode = implNode?.childForFieldName('type') ?? null;
+      if (implTypeNode !== null) {
+        grouped['@type-binding.type'] = syntheticCapture(
+          '@type-binding.type',
+          tbTypeNode,
+          implTypeNode.text,
+        );
+      }
+    }
+
     // Hoist return-type bindings from impl block functions to module level.
     // The auto-hoist in the scope-extractor places a type binding whose
     // anchor matches its innermost scope on the parent scope. By using the
@@ -115,7 +160,7 @@ export function emitRustScopeCaptures(
       grouped['@type-binding.name'] !== undefined
     ) {
       const tbReturnAnchor = grouped['@type-binding.return']!;
-      const fnNode = findNodeAtRange(tree.rootNode, tbReturnAnchor.range, 'function_item');
+      const fnNode = nodeIfType(nodeMap['@type-binding.return'], 'function_item');
       if (fnNode !== null) {
         const implNode = findEnclosingImpl(fnNode);
         if (implNode !== null) {
@@ -141,24 +186,106 @@ export function emitRustScopeCaptures(
     }
 
     // Attach call arity for call expressions
-    const callAnchor =
-      grouped['@reference.call.free'] ??
-      grouped['@reference.call.member'] ??
-      grouped['@reference.call.constructor'];
-    if (callAnchor !== undefined) {
-      const callNode =
-        findNodeAtRange(tree.rootNode, callAnchor.range, 'call_expression') ??
-        findNodeAtRange(tree.rootNode, callAnchor.range, 'struct_expression');
+    const callAnchorNode =
+      nodeMap['@reference.call.free'] ??
+      nodeMap['@reference.call.member'] ??
+      nodeMap['@reference.call.constructor'];
+    if (callAnchorNode !== undefined) {
+      const callNode = nodeIfType(callAnchorNode, 'call_expression', 'struct_expression');
       if (callNode !== null) {
         const arity = computeRustCallArity(callNode);
         grouped['@reference.arity'] = syntheticCapture('@reference.arity', callNode, String(arity));
       }
     }
 
+    // Structural receiver chain for a call whose receiver is itself an
+    // expression, so resolution can type it by folding over structure
+    // instead of re-parsing the receiver's source text. Self-gating: a
+    // non-call match, an absent receiver, or a chain with no nameable base
+    // all leave `grouped` untouched.
+    synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
     out.push(grouped);
   }
 
+  out.push(...synthesizeRustInheritanceReferences(tree.rootNode));
+  out.push(...synthesizeCallableFlowCaptures(tree.rootNode, RUST_CALLABLE_CAPTURE_OPTIONS));
+
   return out;
+}
+
+/**
+ * Synthesize `@reference.inherits` captures from Rust trait `impl` blocks so
+ * the registry-primary scope-resolution path can emit the IMPLEMENTS edge for
+ * `impl Trait for Struct` (mirrors the legacy heritage-capture leg, removed in
+ * #942, which the worker pipeline drops for registry-primary languages — #1951).
+ *
+ * Rust inheritance is structurally unlike a base list on a type declaration:
+ * the relationship lives on `impl_item { trait: T, type: S }`, meaning
+ * `S IMPLEMENTS T`. The shared `preEmitInheritanceEdges` derives an edge's
+ * SOURCE from the enclosing *class* def of the `@reference.inherits` site, but
+ * an `impl_item` scope owns no class-like def (the struct `S` is declared
+ * elsewhere as a `struct_item`), so `findEnclosingClassDef` returns undefined
+ * and that pass emits nothing for these sites (it still marks them handled,
+ * suppressing the generic reference bridge). The real IMPLEMENTS edge is
+ * therefore emitted by `rustScopeResolver.emitHeritageEdges`, which reads these
+ * sites back from `parsedFiles[*].referenceSites`.
+ *
+ * To carry both ends of the relationship through a single reference site we
+ * encode: `@reference.name` = the trait `T` (becomes `site.name`, the IMPLEMENTS
+ * target) and `@reference.receiver` = the struct `S` (becomes
+ * `site.explicitReceiver.name`, the IMPLEMENTS source).
+ *
+ * Parity is intentionally pinned to the legacy heritage query's `impl_item`
+ * patterns: both `trait:` and `type:` normalize to the base's trailing bare
+ * `type_identifier` — directly, via a `scoped_type_identifier`'s `name:` tail
+ * (`crate::traits::Drawable` → `Drawable`; KTD-1 tail resolution), or through a
+ * `generic_type`'s `type:` field (which may itself be either). Inherent impls
+ * (`impl S {}`, no `trait:` field) still emit nothing.
+ */
+function synthesizeRustInheritanceReferences(root: SyntaxNode): CaptureMatch[] {
+  const out: CaptureMatch[] = [];
+  walkNamedTree(root, (node) => {
+    if (node.type !== 'impl_item') return;
+    const traitField = node.childForFieldName('trait');
+    const typeField = node.childForFieldName('type');
+    if (traitField === null || typeField === null) return;
+    const traitName = bareTypeIdentifier(traitField);
+    const structName = bareTypeIdentifier(typeField);
+    if (traitName === null || structName === null) return;
+    out.push({
+      '@reference.inherits': nodeToCapture('@reference.inherits', traitName),
+      '@reference.name': nodeToCapture('@reference.name', traitName),
+      '@reference.receiver': syntheticCapture('@reference.receiver', structName, structName.text),
+    });
+  });
+  return out;
+}
+
+/**
+ * Normalize a `trait:` / `type:` impl_item field to the base's trailing bare
+ * `type_identifier`, matching exactly the node shapes the legacy heritage
+ * query accepted (kept at parity — see the `impl_item` heritage arm in
+ * tree-sitter-queries.ts):
+ *   - `type_identifier`                                  → the node itself
+ *   - `scoped_type_identifier name: (type_identifier)`   → the trailing `name:` id
+ *     (`crate::traits::Drawable` → `Drawable`; KTD-1 tail resolution — the
+ *     simple name then resolves scope-aware via `emitRustTraitImplEdges`)
+ *   - `generic_type type: <any of the above>`            → recurse into `type:`
+ *     (covers `Box<T>` and `m::Wrapped<T>`)
+ * Any other node type returns null (no edge), keeping this emitter at parity
+ * with the legacy query.
+ */
+function bareTypeIdentifier(node: SyntaxNode): SyntaxNode | null {
+  if (node.type === 'type_identifier') return node;
+  if (node.type === 'scoped_type_identifier') {
+    const tail = node.childForFieldName('name');
+    return tail !== null && tail.type === 'type_identifier' ? tail : null;
+  }
+  if (node.type === 'generic_type') {
+    const inner = node.childForFieldName('type');
+    return inner !== null ? bareTypeIdentifier(inner) : null;
+  }
+  return null;
 }
 
 function findEnclosingImpl(node: SyntaxNode): SyntaxNode | null {

@@ -1,14 +1,13 @@
 /**
  * TypeScript and JavaScript language providers.
  *
- * Both languages share the same type extraction config (typescriptConfig),
- * export checker (tsExportChecker), and named binding extractor
- * (extractTsNamedBindings). They differ in file extensions, tree-sitter
+ * Both languages share the same type extraction config (typescriptConfig)
+ * and export checker (tsExportChecker). They differ in file extensions, tree-sitter
  * queries (TypeScript grammar has interface/type nodes), and language ID.
  */
 
 import { SupportedLanguages } from 'gitnexus-shared';
-import type { NodeLabel } from 'gitnexus-shared';
+import type { CaptureMatch, NodeLabel } from 'gitnexus-shared';
 import { defineLanguage } from '../language-provider.js';
 import type { AstFrameworkPatternConfig } from '../language-provider.js';
 import { createClassExtractor } from '../class-extractors/generic.js';
@@ -17,6 +16,62 @@ import {
   javascriptClassConfig,
 } from '../class-extractors/configs/typescript-javascript.js';
 import type { SyntaxNode } from '../utils/ast-helpers.js';
+import {
+  createLeadingDocDescriptionExtractor,
+  isCjsDefaultExportAssignment,
+  isPrototypeMemberAssignmentNode,
+} from '../utils/ast-helpers.js';
+import {
+  cjsExportedNameFor,
+  isModuleLevelThisAssignment,
+  isModuleLevelThisExport,
+  isShadowedCjsExportAssignmentNode,
+} from './typescript/cjs-export-assignment.js';
+
+const rootOf = (node: SyntaxNode): SyntaxNode | undefined =>
+  (node as { tree?: { rootNode?: SyntaxNode } }).tree?.rootNode;
+
+/** `exports.X = fn` where the module already declares `X` — see #2723. */
+const isShadowedCjsExportNode = (node: SyntaxNode): boolean => {
+  const root = rootOf(node);
+  return root !== undefined && isShadowedCjsExportAssignmentNode(node, root);
+};
+
+/**
+ * Label for a `<receiver>.<member> = <function>` capture (#2723 follow-up).
+ *
+ * The member-assignment queries match ANY identifier receiver, because an
+ * `exports` alias (`const e = exports; e.foo = fn`) cannot be pinned in the
+ * query. Everything that is not a recognised shape is dropped HERE — without
+ * that, every `obj.handler = function () {}` in every JS/TS file would emit a
+ * spurious top-level `Function` named `handler`.
+ *
+ * Recognised: a CJS export (direct, `module.exports`, or via a module-scope
+ * alias) stays a Function; a prototype or `this` member becomes a Method; a
+ * CJS export shadowing a name the module already declares emits nothing.
+ */
+const memberAssignmentLabel = (node: SyntaxNode): NodeLabel | null => {
+  const root = rootOf(node);
+
+  // Module-level `this.X = fn` in CommonJS IS `module.exports.X = fn`, so it
+  // is an exported Function, not an instance member. Checked before the
+  // Method branch, which would otherwise claim every `this` receiver.
+  if (root !== undefined && isModuleLevelThisExport(node, root)) return 'Function';
+  // `module.exports = fn` — the module itself is the callable.
+  if (isCjsDefaultExportAssignment(node)) return 'Function';
+  // A module-level `this` member in ESM or a no-signal file is neither an
+  // export (top-level `this` is undefined) nor an instance member. Emitting a
+  // Method there minted an ownerless node (#2729 review F13).
+  if (isModuleLevelThisAssignment(node)) return null;
+  if (isPrototypeMemberAssignmentNode(node)) return 'Method';
+  if (isShadowedCjsExportNode(node)) return null;
+
+  const value = node.childForFieldName('right');
+  if (root === undefined || value === null) return null;
+
+  return cjsExportedNameFor(value, root) !== null ? 'Function' : null;
+};
+import { createTypeScriptCfgVisitor } from '../cfg/visitors/typescript.js';
 import { typeConfig as typescriptConfig } from '../type-extractors/typescript.js';
 import { tsExportChecker } from '../export-detection.js';
 import { createImportResolver } from '../import-resolvers/resolver-factory.js';
@@ -24,7 +79,6 @@ import {
   typescriptImportConfig,
   javascriptImportConfig,
 } from '../import-resolvers/configs/typescript-javascript.js';
-import { extractTsNamedBindings } from '../named-bindings/typescript.js';
 import { TYPESCRIPT_QUERIES, JAVASCRIPT_QUERIES } from '../tree-sitter-queries.js';
 import { typescriptFieldExtractor } from '../field-extractors/typescript.js';
 import { createFieldExtractor } from '../field-extractors/generic.js';
@@ -44,7 +98,11 @@ import {
   typescriptCallConfig,
   javascriptCallConfig,
 } from '../call-extractors/configs/typescript-javascript.js';
-import { createHeritageExtractor } from '../heritage-extractors/generic.js';
+import {
+  ARRAY_METHOD_HOC_BLOCKLIST_SET,
+  DEFAULT_EXPORT_IDENTIFIER_BLOCKLIST_SET,
+  deriveDefaultExportHocName,
+} from '../ts-js-hoc-utils.js';
 import {
   emitTsScopeCaptures,
   interpretTsImport,
@@ -95,6 +153,7 @@ import {
  */
 const tsExtractFunctionName = (
   node: SyntaxNode,
+  filePath?: string,
 ): { funcName: string | null; label: NodeLabel } | null => {
   if (node.type !== 'arrow_function' && node.type !== 'function_expression') return null;
 
@@ -141,28 +200,64 @@ const tsExtractFunctionName = (
   // `arguments`, grandparent is `call_expression`, great-grandparent is
   // `variable_declarator`. Walk the chain up and take the variable's name
   // — the meaningful identifier the developer wrote on the LHS. Mirrors
-  // the four registry-primary patterns in `typescript/query.ts`. The
-  // wrapping callee (`forwardRef`, `memo`, `React.memo`, `useCallback`,
-  // user-defined HOCs) is intentionally NOT constrained: any function
-  // call whose result is bound to a const and whose first/positional
-  // argument is an arrow takes the const's name. Chained array-method
-  // calls (`const x = arr.find((y) => p(y))`) match too and produce a
-  // mostly-harmless `Function:x` (consumed as a value, never invoked),
-  // accepted as a small false-positive cost vs. the much larger gain of
-  // capturing the React UI-component idiom.
+  // the four registry-primary patterns in `typescript/query.ts`.
+  //
+  // NOTE: Excludes common array methods (map, filter, reduce, etc.) to avoid
+  // false positives like `const x = arr.map(a => ...)` being classified as
+  // Function when it's actually a Const holding an array.
   if (parent.type === 'arguments') {
     const callExpr = parent.parent;
     if (!callExpr || callExpr.type !== 'call_expression') {
       return { funcName: null, label: 'Function' };
     }
+
+    // Check if callee is a member_expression calling an array method
+    const callee = callExpr.childForFieldName?.('function');
+    if (callee?.type === 'member_expression') {
+      const property = callee.childForFieldName?.('property');
+      if (
+        property?.type === 'property_identifier' &&
+        ARRAY_METHOD_HOC_BLOCKLIST_SET.has(property.text)
+      ) {
+        return { funcName: null, label: 'Function' };
+      }
+    }
+
     const declarator = callExpr.parent;
-    if (!declarator || declarator.type !== 'variable_declarator') {
+
+    // Existing path: const X = HOC(arrow)
+    if (declarator?.type === 'variable_declarator') {
+      const nameNode = declarator.childForFieldName?.('name');
+      if (nameNode?.type === 'identifier') {
+        return { funcName: nameNode.text, label: 'Function' };
+      }
       return { funcName: null, label: 'Function' };
     }
-    const nameNode = declarator.childForFieldName?.('name');
-    if (nameNode?.type === 'identifier') {
-      return { funcName: nameNode.text, label: 'Function' };
+
+    // export default HOC(arrow) — name it from the file, not the wrapper.
+    // This keeps route handlers and wrapped defaults navigable without
+    // collapsing every file onto names like `memo` or `defineEventHandler`.
+    if (declarator?.type === 'export_statement') {
+      if (callee?.type === 'identifier') {
+        if (DEFAULT_EXPORT_IDENTIFIER_BLOCKLIST_SET.has(callee.text)) {
+          return { funcName: null, label: 'Function' };
+        }
+        return {
+          funcName: filePath ? deriveDefaultExportHocName(filePath) : null,
+          label: 'Function',
+        };
+      }
+      // Member-expression callees like React.memo keep the same file-derived
+      // name, with array-like helpers excluded above.
+      if (callee?.type === 'member_expression') {
+        return {
+          funcName: filePath ? deriveDefaultExportHocName(filePath) : null,
+          label: 'Function',
+        };
+      }
+      return { funcName: null, label: 'Function' };
     }
+
     return { funcName: null, label: 'Function' };
   }
 
@@ -266,6 +361,18 @@ export const BUILT_INS: ReadonlySet<string> = new Set([
   'valueOf',
 ]);
 
+/**
+ * `this` is the only receiver keyword JavaScript and TypeScript bind, and it
+ * is bound by every function form except an arrow (#2701). The query files
+ * tag those forms with `@receiver-owner.this`; this hook just reads the tag,
+ * so the node-type list stays in the one place that already names grammar
+ * nodes. See `Scope.ownsReceivers` for what the marker does to the walk.
+ */
+const TS_OWNED_RECEIVERS: ReadonlySet<string> = new Set(['this']);
+
+const tsScopeOwnsReceivers = (match: CaptureMatch): ReadonlySet<string> | undefined =>
+  match['@receiver-owner.this'] === undefined ? undefined : TS_OWNED_RECEIVERS;
+
 export const typescriptProvider = defineLanguage({
   id: SupportedLanguages.TypeScript,
   extensions: ['.ts', '.tsx'],
@@ -294,9 +401,9 @@ export const typescriptProvider = defineLanguage({
   ] satisfies AstFrameworkPatternConfig[],
   treeSitterQueries: TYPESCRIPT_QUERIES,
   typeConfig: typescriptConfig,
+  scopeOwnsReceivers: tsScopeOwnsReceivers,
   exportChecker: tsExportChecker,
   importResolver: createImportResolver(typescriptImportConfig),
-  namedBindingExtractor: extractTsNamedBindings,
   callExtractor: createCallExtractor(typescriptCallConfig),
   fieldExtractor: typescriptFieldExtractor,
   methodExtractor: createMethodExtractor({
@@ -305,8 +412,27 @@ export const typescriptProvider = defineLanguage({
   }),
   variableExtractor: createVariableExtractor(typescriptVariableConfig),
   classExtractor: createClassExtractor(typescriptClassConfig),
-  heritageExtractor: createHeritageExtractor(SupportedLanguages.TypeScript),
+  // ── JSDoc → description (issue #2270). An exported decl is captured as the
+  //    inner declaration; its JSDoc precedes the wrapping `export_statement`. ──
+  descriptionExtractor: createLeadingDocDescriptionExtractor({
+    wrapperNodeTypes: ['export_statement'],
+  }),
   builtInNames: BUILT_INS,
+
+  // Member-assignment shapes are not free functions (#2723 follow-up). The
+  // capture arrives anchored on the assignment, so the shape is decided from
+  // the left-hand side:
+  //   - `Foo.prototype.bar = fn` / `this.bar = fn` -> a Method
+  //   - a CJS export shadowing a name the module already declares -> no node
+  //     at all, since the scope declaration that would reach it is suppressed
+  //     too (an orphan `Function` twin beside `class Dup {}` otherwise).
+  // Every other `definition.function` capture keeps its default label.
+  labelOverride: (functionNode, defaultLabel) =>
+    defaultLabel !== 'Function'
+      ? defaultLabel
+      : functionNode.type === 'assignment_expression'
+        ? memberAssignmentLabel(functionNode)
+        : defaultLabel,
 
   // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
   // TypeScript is the third migration after Python and C#. See
@@ -314,6 +440,8 @@ export const typescriptProvider = defineLanguage({
   // canonical capture vocabulary in ./typescript/query.ts
   // (TYPESCRIPT_SCOPE_QUERY constant).
   emitScopeCaptures: emitTsScopeCaptures,
+  // CFG/PDG substrate (#2081 M1) — runs in the worker on a --pdg run.
+  cfgVisitor: createTypeScriptCfgVisitor(),
   interpretImport: interpretTsImport,
   interpretTypeBinding: interpretTsTypeBinding,
   bindingScopeFor: tsBindingScopeFor,
@@ -356,9 +484,9 @@ export const javascriptProvider = defineLanguage({
   ] satisfies AstFrameworkPatternConfig[],
   treeSitterQueries: JAVASCRIPT_QUERIES,
   typeConfig: typescriptConfig,
+  scopeOwnsReceivers: tsScopeOwnsReceivers,
   exportChecker: tsExportChecker,
   importResolver: createImportResolver(javascriptImportConfig),
-  namedBindingExtractor: extractTsNamedBindings,
   callExtractor: createCallExtractor(javascriptCallConfig),
   fieldExtractor: createFieldExtractor(javascriptConfig),
   methodExtractor: createMethodExtractor({
@@ -367,8 +495,20 @@ export const javascriptProvider = defineLanguage({
   }),
   variableExtractor: createVariableExtractor(javascriptVariableConfig),
   classExtractor: createClassExtractor(javascriptClassConfig),
-  heritageExtractor: createHeritageExtractor(SupportedLanguages.JavaScript),
+  // ── JSDoc → description (issue #2270). An exported decl is captured as the
+  //    inner declaration; its JSDoc precedes the wrapping `export_statement`. ──
+  descriptionExtractor: createLeadingDocDescriptionExtractor({
+    wrapperNodeTypes: ['export_statement'],
+  }),
   builtInNames: BUILT_INS,
+
+  // Member-assignment shapes — see the TypeScript provider above.
+  labelOverride: (functionNode, defaultLabel) =>
+    defaultLabel !== 'Function'
+      ? defaultLabel
+      : functionNode.type === 'assignment_expression'
+        ? memberAssignmentLabel(functionNode)
+        : defaultLabel,
 
   // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
   // JavaScript is the fourth migration after Python, C#, and TypeScript.
@@ -377,6 +517,8 @@ export const javascriptProvider = defineLanguage({
   // JSDoc type bindings) live in ./javascript/captures.ts.
   // See ./javascript/index.ts for the full per-module rationale.
   emitScopeCaptures: emitJsScopeCaptures,
+  // CFG/PDG substrate (#2081 M1) — TS and JS share the same grammar family.
+  cfgVisitor: createTypeScriptCfgVisitor(),
   interpretImport: interpretJsImport,
   interpretTypeBinding: interpretJsTypeBinding,
   bindingScopeFor: jsBindingScopeFor,

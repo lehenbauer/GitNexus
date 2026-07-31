@@ -83,7 +83,28 @@ export type { ResolveTypeRefContext } from './scope-resolution/resolve-type-ref.
 
 // ScopeExtractor output contracts (RFC §3.2 Phase 1; Ring 2 PKG #919)
 export type { ParsedFile } from './scope-resolution/parsed-file.js';
-export type { ReferenceSite, ReferenceKind, CallForm } from './scope-resolution/reference-site.js';
+export type {
+  ReferenceSite,
+  ReferenceKind,
+  CallForm,
+  MixedChainStep,
+} from './scope-resolution/reference-site.js';
+export type {
+  CallableFlowOperand,
+  CallableFlowExpectedSignature,
+  CallableFlowPassingMode,
+  CallableFlowInvocationKind,
+  CallableFlowSeedSite,
+  CallableFlowCopySite,
+  CallableFlowAliasSite,
+  CallableFlowAddressSite,
+  CallableFlowStoreSite,
+  CallableFlowLoadSite,
+  CallableFlowFormalSite,
+  CallableFlowArgumentSite,
+  CallableFlowInvokeSite,
+  CallableFlowSite,
+} from './scope-resolution/callable-flow-site.js';
 
 // Method-dispatch materialized view over HeritageMap (RFC §3.1; Ring 2 SHARED #914)
 export { buildMethodDispatchIndex } from './scope-resolution/method-dispatch-index.js';
@@ -116,6 +137,8 @@ export type {
   FieldRegistry,
   FieldLookupOptions,
 } from './scope-resolution/registries/field-registry.js';
+export { buildMacroRegistry } from './scope-resolution/registries/macro-registry.js';
+export type { MacroRegistry } from './scope-resolution/registries/macro-registry.js';
 export { lookupCore } from './scope-resolution/registries/lookup-core.js';
 export type { CoreLookupParams } from './scope-resolution/registries/lookup-core.js';
 export { lookupQualified } from './scope-resolution/registries/lookup-qualified.js';
@@ -127,7 +150,12 @@ export {
   CONFIDENCE_EPSILON,
 } from './scope-resolution/registries/tie-breaks.js';
 export type { TieBreakKey } from './scope-resolution/registries/tie-breaks.js';
-export { CLASS_KINDS, METHOD_KINDS, FIELD_KINDS } from './scope-resolution/registries/context.js';
+export {
+  CLASS_KINDS,
+  METHOD_KINDS,
+  FIELD_KINDS,
+  MACRO_KINDS,
+} from './scope-resolution/registries/context.js';
 export type {
   RegistryContext,
   RegistryProviders,
@@ -176,13 +204,3 @@ export {
   stripGitSuffix,
 } from './integrations/understand-quickly.js';
 export type { UqDispatchPayload } from './integrations/understand-quickly.js';
-
-// Shadow-mode diff + aggregation (RFC §6.3; Ring 2 SHARED #918)
-export { diffResolutions } from './scope-resolution/shadow/diff.js';
-export type {
-  ShadowAgreement,
-  ShadowCallsite,
-  ShadowDiff,
-} from './scope-resolution/shadow/diff.js';
-export { aggregateDiffs } from './scope-resolution/shadow/aggregate.js';
-export type { LanguageParityRow, ShadowParityReport } from './scope-resolution/shadow/aggregate.js';

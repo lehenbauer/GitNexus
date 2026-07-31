@@ -9,11 +9,16 @@ import {
   Pause,
   Lightbulb,
   LightbulbOff,
+  Network,
+  GitBranch,
+  Target,
 } from '@/lib/lucide-icons';
 import { useSigma } from '../hooks/useSigma';
 import { useAppState } from '../hooks/useAppState';
 import {
   knowledgeGraphToGraphology,
+  knowledgeGraphToTreeGraphology,
+  knowledgeGraphToCirclesGraphology,
   filterGraphByDepth,
   SigmaNodeAttributes,
   SigmaEdgeAttributes,
@@ -22,6 +27,8 @@ import type { GraphNode } from 'gitnexus-shared';
 import { QueryFAB } from './QueryFAB';
 import Graph from 'graphology';
 import { useTranslation } from 'react-i18next';
+import { LARGE_GRAPH_NODE_THRESHOLD } from '../config/ui-constants';
+import { shouldConfirmGraphLoad } from '../lib/graph-load-decision';
 
 export interface GraphCanvasHandle {
   focusNode: (nodeId: string) => void;
@@ -48,6 +55,11 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     clearAICitationHighlights,
     clearBlastRadius,
     animatedNodes,
+    graphViewMode,
+    setGraphViewMode,
+    graphMode,
+    chatOnlyNodeCount,
+    loadGraphAnyway,
   } = useAppState();
   const [hoveredNodeName, setHoveredNodeName] = useState<string | null>(null);
 
@@ -149,7 +161,21 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     blastRadiusNodeIds: effectiveBlastRadiusNodeIds,
     animatedNodes: effectiveAnimatedNodes,
     visibleEdgeTypes,
+    layoutMode: graphViewMode,
   });
+
+  const handleViewModeChange = useCallback(
+    (mode: 'force' | 'tree' | 'circles') => {
+      if (mode === graphViewMode) return;
+      setSelectedNode(null);
+      setSigmaSelectedNode(null);
+      setHoveredNodeName(null);
+      setGraphViewMode(mode);
+      // Reset zoom when switching views
+      resetZoom();
+    },
+    [graphViewMode, resetZoom, setGraphViewMode, setSelectedNode, setSigmaSelectedNode],
+  );
 
   // Expose focusNode to parent via ref
   useImperativeHandle(
@@ -172,27 +198,35 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
 
   // Update Sigma graph when KnowledgeGraph changes
   useEffect(() => {
-    if (!graph) return;
+    // Skip layout work in chat-only mode: `graph` is non-null but empty, the
+    // overlay covers the canvas, and this guard also future-proofs against a
+    // transient where a populated graph is set while mode is still chat-only.
+    if (!graph || graphMode === 'chatOnly') return;
 
-    // Build communityMemberships map from MEMBER_OF relationships
-    // MEMBER_OF edges: nodeId -> communityId (stored as targetId)
-    const communityMemberships = new Map<string, number>();
-    graph.relationships.forEach((rel) => {
-      if (rel.type === 'MEMBER_OF') {
-        // Find the community node to get its index
-        const communityNode = nodeById.get(rel.targetId);
-        if (communityNode && communityNode.label === 'Community') {
-          // Extract community index from id (e.g., "comm_5" -> 5)
-          const numericPart = rel.targetId.replace('comm_', '');
-          const communityIdx = /^\d+$/.test(numericPart) ? parseInt(numericPart, 10) : 0;
-          communityMemberships.set(rel.sourceId, communityIdx);
+    let sigmaGraph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>;
+
+    if (graphViewMode === 'tree') {
+      sigmaGraph = knowledgeGraphToTreeGraphology(graph);
+    } else if (graphViewMode === 'circles') {
+      sigmaGraph = knowledgeGraphToCirclesGraphology(graph);
+    } else {
+      // Build community memberships map from MEMBER_OF relationships
+      const communityMemberships = new Map<string, number>();
+      graph.relationships.forEach((rel) => {
+        if (rel.type === 'MEMBER_OF') {
+          const communityNode = nodeById.get(rel.targetId);
+          if (communityNode && communityNode.label === 'Community') {
+            const numericPart = rel.targetId.replace('comm_', '');
+            const communityIdx = /^\d+$/.test(numericPart) ? parseInt(numericPart, 10) : 0;
+            communityMemberships.set(rel.sourceId, communityIdx);
+          }
         }
-      }
-    });
+      });
+      sigmaGraph = knowledgeGraphToGraphology(graph, communityMemberships);
+    }
 
-    const sigmaGraph = knowledgeGraphToGraphology(graph, communityMemberships);
     setSigmaGraph(sigmaGraph);
-  }, [graph, nodeById, setSigmaGraph]);
+  }, [graph, graphMode, nodeById, setSigmaGraph, graphViewMode]);
 
   // Update node visibility when filters change
   useEffect(() => {
@@ -205,7 +239,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     filterGraphByDepth(sigmaGraph, appSelectedNode?.id || null, depthFilter, visibleLabels);
     sigma.refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps -- sigmaRef identity never changes
-  }, [visibleLabels, depthFilter, appSelectedNode]);
+  }, [graph, graphViewMode, visibleLabels, depthFilter, appSelectedNode]);
 
   // Sync app selected node with sigma
   useEffect(() => {
@@ -230,6 +264,37 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     resetZoom();
   }, [setSelectedNode, setSigmaSelectedNode, resetZoom]);
 
+  // Chat-only mode (#2178): the graph download was skipped. `chatOnlyNodeCount`
+  // comes from app state (captured at connect time), so it is authoritative and
+  // available immediately — not derived from the async `availableRepos` list.
+  const handleLoadGraphAnyway = useCallback(() => {
+    // Warn before re-triggering a potentially browser-hanging download. Confirm
+    // whenever the count is large OR unknown — never silently re-load a graph we
+    // can't size, which would risk re-introducing the original #2178 hang. Skip
+    // the prompt only when the count is known to be below the threshold (a small
+    // repo force-skipped via ?skipGraph=1).
+    const needsConfirm = shouldConfirmGraphLoad(chatOnlyNodeCount, LARGE_GRAPH_NODE_THRESHOLD);
+    if (needsConfirm) {
+      // Fail SAFE, not open: if there's no usable confirm dialog (some embedded
+      // webviews) or it throws, treat it as declined rather than loading a
+      // graph we couldn't warn about (#2178).
+      const canPrompt = typeof window !== 'undefined' && typeof window.confirm === 'function';
+      if (!canPrompt) return;
+      let confirmed = false;
+      try {
+        confirmed = window.confirm(
+          chatOnlyNodeCount != null
+            ? t('canvas.chatOnly.loadAnywayWarning', { count: chatOnlyNodeCount.toLocaleString() })
+            : t('canvas.chatOnly.loadAnywayWarningUnknown'),
+        );
+      } catch {
+        return;
+      }
+      if (!confirmed) return;
+    }
+    void loadGraphAnyway();
+  }, [chatOnlyNodeCount, loadGraphAnyway, t]);
+
   return (
     <div className="relative h-full w-full bg-void">
       {/* Background gradient */}
@@ -245,11 +310,84 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
         />
       </div>
 
+      {/* View Mode Tabs */}
+      <div
+        role="tablist"
+        aria-label={t('canvas.viewModes.label')}
+        className="absolute top-4 left-1/2 z-20 flex -translate-x-1/2 gap-1 rounded-lg border border-border-subtle bg-elevated/90 p-1 backdrop-blur-sm"
+      >
+        <button
+          role="tab"
+          aria-selected={graphViewMode === 'force'}
+          onClick={() => handleViewModeChange('force')}
+          className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-all ${
+            graphViewMode === 'force'
+              ? 'bg-accent text-white'
+              : 'text-text-secondary hover:bg-hover hover:text-text-primary'
+          }`}
+        >
+          <Network className="h-3.5 w-3.5" />
+          {t('canvas.viewModes.force')}
+        </button>
+        <button
+          role="tab"
+          aria-selected={graphViewMode === 'tree'}
+          onClick={() => handleViewModeChange('tree')}
+          className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-all ${
+            graphViewMode === 'tree'
+              ? 'bg-accent text-white'
+              : 'text-text-secondary hover:bg-hover hover:text-text-primary'
+          }`}
+        >
+          <GitBranch className="h-3.5 w-3.5" />
+          {t('canvas.viewModes.tree')}
+        </button>
+        <button
+          role="tab"
+          aria-selected={graphViewMode === 'circles'}
+          onClick={() => handleViewModeChange('circles')}
+          className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-all ${
+            graphViewMode === 'circles'
+              ? 'bg-accent text-white'
+              : 'text-text-secondary hover:bg-hover hover:text-text-primary'
+          }`}
+        >
+          <Target className="h-3.5 w-3.5" />
+          {t('canvas.viewModes.circles')}
+        </button>
+      </div>
+
       {/* Sigma container */}
       <div
         ref={containerRef}
         className="sigma-container h-full w-full cursor-grab active:cursor-grabbing"
       />
+
+      {/* Chat-only empty state (#2178): graph download was skipped for a large
+          project. Chat works normally; offer an explicit "load anyway" escape. */}
+      {graphMode === 'chatOnly' && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center p-6">
+          <div className="max-w-md rounded-xl border border-border-subtle bg-elevated/95 p-6 text-center shadow-lg backdrop-blur-sm">
+            <h3 className="text-lg font-semibold text-text-primary">
+              {t('canvas.chatOnly.title')}
+            </h3>
+            <p className="mt-2 text-sm text-text-secondary">
+              {chatOnlyNodeCount != null
+                ? t('canvas.chatOnly.descriptionWithCount', {
+                    count: chatOnlyNodeCount.toLocaleString(),
+                  })
+                : t('canvas.chatOnly.description')}
+            </p>
+            <p className="mt-2 text-xs text-text-muted">{t('canvas.chatOnly.citationNote')}</p>
+            <button
+              onClick={handleLoadGraphAnyway}
+              className="mt-4 rounded-md border border-accent/30 bg-accent/20 px-4 py-2 text-sm font-medium text-accent transition-colors hover:bg-accent/30"
+            >
+              {t('canvas.chatOnly.loadAnyway')}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Hovered node tooltip - only show when NOT selected */}
       {hoveredNodeName && !sigmaSelectedNode && (

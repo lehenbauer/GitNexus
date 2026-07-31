@@ -120,6 +120,19 @@ describe('emitCScopeCaptures — enum declarations', () => {
     expect(names).toContain('GREEN');
     expect(names).toContain('BLUE');
   });
+
+  it('captures typedef anonymous enum with @declaration.enum (not typedef)', () => {
+    const m = findMatch('typedef enum { OFF, ON } SwitchState;', (t) =>
+      t.includes('@declaration.enum'),
+    );
+    expect(m).toBeDefined();
+    expect(m!['@declaration.name'].text).toBe('SwitchState');
+
+    const typedefs = allMatches('typedef enum { OFF, ON } SwitchState;', (t) =>
+      t.includes('@declaration.typedef'),
+    );
+    expect(typedefs).toHaveLength(0);
+  });
 });
 
 describe('emitCScopeCaptures — function declarations', () => {
@@ -183,6 +196,14 @@ describe('emitCScopeCaptures — other declarations', () => {
     const m = findMatch('int x = 42;', (t) => t.includes('@declaration.variable'));
     expect(m).toBeDefined();
     expect(m!['@declaration.name'].text).toBe('x');
+  });
+
+  it('captures all names in mixed initialized and uninitialized declarations', () => {
+    const matches = allMatches('void f(void) { int a = 1, b, *p, c = 3, d; }', (t) =>
+      t.includes('@declaration.variable'),
+    );
+    const names = matches.map((m) => m['@declaration.name'].text).sort();
+    expect(names).toEqual(['a', 'b', 'c', 'd', 'p']);
   });
 
   it('captures macro as @declaration.macro', () => {
@@ -351,5 +372,17 @@ describe('emitCScopeCaptures — static storage class', () => {
   it('static pointer-return functions are detected', () => {
     emitCScopeCaptures('static char *get_buffer(void) { return 0; }', 'a.c');
     expect(isStaticName('a.c', 'get_buffer')).toBe(true);
+  });
+});
+
+describe('emitCScopeCaptures — callable-flow signatures', () => {
+  it('variadic function-pointer signatures carry the "..." sentinel and no fixed arity (#2522)', () => {
+    const match = findMatch(
+      'int vlog(const char *fmt, ...) { return 0; }\nint entry(void) { int (*emit)(const char *, ...) = vlog; return 0; }',
+      (tags) => tags.includes('@callable-flow.seed'),
+    );
+    expect(match).toBeDefined();
+    expect(match?.['@callable-flow.expected-types']?.text).toBe('["char","..."]');
+    expect(match?.['@callable-flow.expected-arity']).toBeUndefined();
   });
 });

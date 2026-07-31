@@ -37,12 +37,21 @@ import { findEnclosingClassDef } from '../../scope-resolution/scope/walkers.js';
 
 /**
  * Capture-time record: for each template class declaration in a file,
- * the simple names of its dependent base classes.
+ * the simple names of its dependent base classes and their syntactic
+ * qualifiers (e.g., `detail` for `detail::Inner<T>`).
  *
  * Key: filePath
- * Value: Map<className, Set<dependentBaseSimpleName>>
+ * Value: Map<className, Map<baseName, qualifier>>
+ *   qualifier is '' when the base was unqualified.
  */
-const dependentBasesByFile = new Map<string, Map<string, Set<string>>>();
+const dependentBasesByFile = new Map<string, Map<string, Map<string, Set<string>>>>();
+
+/**
+ * Class templates with pack-expanded bases (`struct Mix : Bases...`) have
+ * an unknown set of base classes. Unqualified member lookup inside the class
+ * cannot safely bind to class-owned methods outside the current class.
+ */
+const dependentPackBaseClassesByFile = new Map<string, Set<string>>();
 
 /**
  * Post-`populateOwners` resolution: per-class-nodeId, the set of
@@ -55,12 +64,19 @@ const dependentBaseNodeIds = new Map<string, Set<string>>();
  * Record a dependent-base relationship discovered during scope-capture
  * emission. `className` is the simple name of the template class;
  * `baseName` is the simple name of the dependent base class.
+ * `qualifier` is the syntactic namespace qualifier (e.g. `detail` for
+ * `detail::Inner<T>`), or '' for unqualified bases.
  *
  * The capture-time recorder uses simple names because the registry
  * resolution that maps names → nodeIds runs later (in
  * `populateCppDependentBases`).
  */
-export function markCppDependentBase(filePath: string, className: string, baseName: string): void {
+export function markCppDependentBase(
+  filePath: string,
+  className: string,
+  baseName: string,
+  qualifier = '',
+): void {
   let perFile = dependentBasesByFile.get(filePath);
   if (perFile === undefined) {
     perFile = new Map();
@@ -68,15 +84,80 @@ export function markCppDependentBase(filePath: string, className: string, baseNa
   }
   let bases = perFile.get(className);
   if (bases === undefined) {
-    bases = new Set();
+    bases = new Map();
     perFile.set(className, bases);
   }
-  bases.add(baseName);
+  let quals = bases.get(baseName);
+  if (quals === undefined) {
+    quals = new Set();
+    bases.set(baseName, quals);
+  }
+  quals.add(qualifier);
+}
+
+export function markCppDependentPackBase(filePath: string, className: string): void {
+  let perFile = dependentPackBaseClassesByFile.get(filePath);
+  if (perFile === undefined) {
+    perFile = new Set();
+    dependentPackBaseClassesByFile.set(filePath, perFile);
+  }
+  perFile.add(className);
+}
+
+/**
+ * Plain-data, JSON-serializable snapshot of the per-file capture-time
+ * two-phase-lookup state. Carried on `ParsedFile.captureSideChannel` across the
+ * worker→main boundary (#1983). The resolved `dependentBaseNodeIds` index is
+ * rebuilt by `populateCppDependentBases` (workspace pass) after all files have
+ * their `populateOwners` applied, so only the two capture-time maps cross.
+ *
+ * Nested `Map`/`Set` are flattened to arrays here so the snapshot stays plain
+ * JSON (avoids relying on the parsedfile-store's Map/Set replacer for nested
+ * structures): `dependentBases` is `[className, [baseName, qualifiers[]][]][]`.
+ */
+export interface CppTwoPhaseSideChannel {
+  readonly dependentBases: readonly [string, readonly [string, readonly string[]][]][];
+  readonly dependentPackBaseClasses: readonly string[];
+}
+
+/** Snapshot this file's two-phase-lookup capture state for the side-channel. */
+export function collectCppTwoPhaseSideChannel(filePath: string): CppTwoPhaseSideChannel {
+  const perFile = dependentBasesByFile.get(filePath);
+  const dependentBases: [string, [string, string[]][]][] = [];
+  if (perFile !== undefined) {
+    for (const [className, bases] of perFile) {
+      const baseEntries: [string, string[]][] = [];
+      for (const [baseName, quals] of bases) {
+        baseEntries.push([baseName, [...quals]]);
+      }
+      dependentBases.push([className, baseEntries]);
+    }
+  }
+  const pack = dependentPackBaseClassesByFile.get(filePath);
+  return {
+    dependentBases,
+    dependentPackBaseClasses: pack === undefined ? [] : [...pack],
+  };
+}
+
+/** Restore this file's two-phase-lookup capture state from the side-channel. */
+export function applyCppTwoPhaseSideChannel(filePath: string, data: CppTwoPhaseSideChannel): void {
+  for (const [className, baseEntries] of data.dependentBases) {
+    for (const [baseName, quals] of baseEntries) {
+      for (const qualifier of quals) {
+        markCppDependentBase(filePath, className, baseName, qualifier);
+      }
+    }
+  }
+  for (const className of data.dependentPackBaseClasses) {
+    markCppDependentPackBase(filePath, className);
+  }
 }
 
 /** Clear two-phase-lookup state. Called from `clearFileLocalNames`. */
 export function clearCppDependentBases(): void {
   dependentBasesByFile.clear();
+  dependentPackBaseClassesByFile.clear();
   dependentBaseNodeIds.clear();
 }
 
@@ -89,17 +170,25 @@ export function clearCppDependentBases(): void {
  * Disambiguation strategy (multiple classes sharing a simple name):
  *  1. Prefer the candidate whose qualified-name namespace prefix matches
  *     the deriving class's namespace prefix (same-namespace bias).
- *  2. Fall back to accepting a unique simple-name match.
- *  3. Skip when multiple candidates exist and no namespace match is
+ *  2. When a syntactic qualifier is available (`detail` in
+ *     `detail::Inner<T>`), target the exact namespace derived from it.
+ *  3. Fall back to accepting a unique simple-name match.
+ *  4. Skip when multiple candidates exist and no namespace match is
  *     found (conservative: avoids false associations).
  */
 export function populateCppDependentBases(parsedFiles: readonly ParsedFile[]): void {
-  if (dependentBasesByFile.size === 0) return;
+  if (dependentBasesByFile.size === 0 && dependentPackBaseClassesByFile.size === 0) return;
 
   // Build workspace-wide index: simpleName → {nodeId, nsPrefix}[]
   // nsPrefix is the dot-joined namespace path (qualifiedName without the
   // last segment). Classes at global scope have nsPrefix = ''.
+  // Dedup by nodeId, keeping the LAST occurrence: parsed.localDefs may
+  // list the same class def multiple times — the scope-extractor creates
+  // a def with simple-name qualifiedName first, then the class extractor
+  // replaces it with the correct fully-qualified qualifiedName. Keeping
+  // the later entry ensures we capture the full namespace path.
   const classesBySimpleName = new Map<string, { nodeId: string; nsPrefix: string }[]>();
+  const entryByNodeId = new Map<string, { nodeId: string; nsPrefix: string; simple: string }>();
   for (const parsed of parsedFiles) {
     for (const def of parsed.localDefs) {
       if (def.type !== 'Class' && def.type !== 'Struct' && def.type !== 'Interface') continue;
@@ -108,13 +197,16 @@ export function populateCppDependentBases(parsedFiles: readonly ParsedFile[]): v
       const simple = lastDot >= 0 ? qn.slice(lastDot + 1) : qn;
       if (simple === '') continue;
       const nsPrefix = lastDot >= 0 ? qn.slice(0, lastDot) : '';
-      let entries = classesBySimpleName.get(simple);
-      if (entries === undefined) {
-        entries = [];
-        classesBySimpleName.set(simple, entries);
-      }
-      entries.push({ nodeId: def.nodeId, nsPrefix });
+      entryByNodeId.set(def.nodeId, { nodeId: def.nodeId, nsPrefix, simple });
     }
+  }
+  for (const entry of entryByNodeId.values()) {
+    let entries = classesBySimpleName.get(entry.simple);
+    if (entries === undefined) {
+      entries = [];
+      classesBySimpleName.set(entry.simple, entries);
+    }
+    entries.push({ nodeId: entry.nodeId, nsPrefix: entry.nsPrefix });
   }
 
   // Build a filePath → ParsedFile lookup for fast per-file access.
@@ -139,7 +231,22 @@ export function populateCppDependentBases(parsedFiles: readonly ParsedFile[]): v
       localClassByName.set(simple, { nodeId: def.nodeId, nsPrefix });
     }
 
-    for (const [className, baseNames] of perFile) {
+    const packBaseClasses = dependentPackBaseClassesByFile.get(filePath);
+    if (packBaseClasses !== undefined) {
+      for (const className of packBaseClasses) {
+        const classEntry = localClassByName.get(className);
+        if (classEntry !== undefined) {
+          dependentBaseNodeIds.set(classEntry.nodeId, new Set(['*pack-expansion*']));
+        }
+      }
+    }
+
+    // V3: qualifier-based exact targeting. When the base specifier carries
+    // a syntactic qualifier (e.g., `detail` in `detail::Inner<T>`), compute
+    // the expected namespace prefix and use exact (===) match. Falls back to
+    // the V2 prefix-contains heuristic when the qualifier isn't available or
+    // the exact match fails (absolute qualifier edge cases like `::std`).
+    for (const [className, baseEntries] of perFile) {
       const classEntry = localClassByName.get(className);
       if (classEntry === undefined) continue;
 
@@ -149,54 +256,77 @@ export function populateCppDependentBases(parsedFiles: readonly ParsedFile[]): v
         dependentBaseNodeIds.set(classEntry.nodeId, bases);
       }
 
-      for (const baseName of baseNames) {
-        const candidates = classesBySimpleName.get(baseName);
-        if (candidates === undefined || candidates.length === 0) continue;
+      for (const [baseName, qualsSet] of baseEntries) {
+        for (const baseQualifier of qualsSet) {
+          const candidates = classesBySimpleName.get(baseName);
+          if (candidates === undefined || candidates.length === 0) continue;
 
-        if (candidates.length === 1) {
-          // Unique simple-name match — accept regardless of namespace.
-          bases.add(candidates[0].nodeId);
-          continue;
-        }
+          // Compute the expected namespace prefix from the qualifier.
+          // Relative qualifier (e.g. `inner`): prepend deriving class's prefix.
+          // Absolute qualifiers (`::std`, `ns::other`) will fail the relative
+          // lookup and fall through to the prefix-heuristic below.
+          const normalizedQualifier = baseQualifier.replace(/::/g, '.');
+          const expectedNs =
+            baseQualifier && classEntry.nsPrefix
+              ? classEntry.nsPrefix + '.' + normalizedQualifier
+              : normalizedQualifier;
 
-        // Multiple classes share the same simple name — prefer the one
-        // whose namespace matches the deriving class's namespace.
-        // V2: filter by prefix-match capped at one level deeper, then
-        // accept only if exactly one candidate survives. This lets
-        // Derived<T> in ns::outer find Inner<T> in ns::outer::inner
-        // (or ns::v1 for inline-namespace variants) while rejecting
-        // sibling collisions (e.g. detail::Inner vs public_api::Inner).
-        //
-        // The one-segment cap limits walk depth: ns → ns.a ✓, ns → ns.a.b ✗.
-        // Global-scope deriving classes match any single-segment namespace.
-        //
-        // LIMITATION: True ISO behavior would use the base specifier's
-        // syntactic qualifier (available at captures.ts:611 as
-        // qualified_identifier scope) to navigate from the current scope,
-        // which would resolve `detail::Inner` vs `public_api::Inner`
-        // unambiguously. Threading the qualifier is tracked in #1815.
-        // Until then, sibling collisions correctly suppress.
-        const nsMatches = candidates.filter((c) => {
-          if (c.nsPrefix === classEntry.nsPrefix) return true;
-          if (classEntry.nsPrefix === '') {
-            return c.nsPrefix !== '' && !c.nsPrefix.includes('.');
+          if (candidates.length === 1) {
+            // Unqualified base: accept unique match (pre-existing behavior).
+            if (!baseQualifier) {
+              bases.add(candidates[0].nodeId);
+              continue;
+            }
+            // Qualified base: verify namespace before accepting.
+            if (
+              candidates[0].nsPrefix === expectedNs ||
+              candidates[0].nsPrefix === normalizedQualifier
+            ) {
+              bases.add(candidates[0].nodeId);
+            }
+            // else: suppress — qualifier doesn't match. #1564 policy.
+            continue;
           }
-          if (c.nsPrefix.startsWith(classEntry.nsPrefix + '.')) {
-            const suffix = c.nsPrefix.slice(classEntry.nsPrefix.length + 1);
-            return !suffix.includes('.');
+
+          // V3: qualifier-based exact targeting. When the base specifier
+          // carries a syntactic qualifier, compute the expected namespace
+          // prefix and attempt an exact (===) match using the deduplicated
+          // nsPrefix. Dedup by nodeId removes broken entries from the
+          // classesBySimpleName index, making the surviving nsPrefix reliable.
+          if (baseQualifier) {
+            const qualifierMatch = candidates.find(
+              (c) => c.nsPrefix === expectedNs || c.nsPrefix === normalizedQualifier,
+            );
+            if (qualifierMatch !== undefined) {
+              bases.add(qualifierMatch.nodeId);
+              continue;
+            }
+            continue; // qualifier was explicit but no match — suppress, don't fall through to V2
           }
-          return false;
-        });
-        const nsMatch = nsMatches.length === 1 ? nsMatches[0] : undefined;
-        if (nsMatch !== undefined) {
-          bases.add(nsMatch.nodeId);
+
+          // V2 fallback: filter by prefix-match capped at one level deeper,
+          // then accept only if exactly one candidate survives.
+          const nsMatches = candidates.filter((c) => {
+            if (c.nsPrefix === classEntry.nsPrefix) return true;
+            if (classEntry.nsPrefix === '') {
+              return c.nsPrefix !== '' && !c.nsPrefix.includes('.');
+            }
+            if (c.nsPrefix.startsWith(classEntry.nsPrefix + '.')) {
+              const suffix = c.nsPrefix.slice(classEntry.nsPrefix.length + 1);
+              return !suffix.includes('.');
+            }
+            return false;
+          });
+          const nsMatch = nsMatches.length === 1 ? nsMatches[0] : undefined;
+          if (nsMatch !== undefined) {
+            bases.add(nsMatch.nodeId);
+          }
+          // else: ambiguous (multiple candidates, no namespace match) → skip.
         }
-        // else: ambiguous (multiple candidates, no namespace match) → skip.
       }
     }
   }
 }
-
 /**
  * Two-phase lookup predicate: is the candidate def a member of a
  * dependent base of the caller's enclosing template class?
@@ -217,10 +347,31 @@ export function isCppDependentBaseMember(
   candidateDef: SymbolDefinition,
   scopes: ScopeResolutionIndexes,
 ): boolean {
-  if (candidateDef.ownerId === undefined) return false;
   const enclosing = findEnclosingClassDef(callerScopeId, scopes);
   if (enclosing === undefined) return false;
   const bases = dependentBaseNodeIds.get(enclosing.nodeId);
   if (bases === undefined) return false;
+  if (bases.has('*pack-expansion*')) {
+    if (candidateDef.ownerId !== undefined) return candidateDef.ownerId !== enclosing.nodeId;
+    if (candidateDef.type !== 'Method' && candidateDef.type !== 'Constructor') return false;
+    const ownerName = getQualifiedParentName(candidateDef.qualifiedName);
+    const enclosingName = getQualifiedSimpleName(enclosing.qualifiedName);
+    return ownerName !== undefined && ownerName !== enclosingName;
+  }
+  if (candidateDef.ownerId === undefined) return false;
   return bases.has(candidateDef.ownerId);
+}
+
+function getQualifiedParentName(qualifiedName: string | undefined): string | undefined {
+  if (qualifiedName === undefined) return undefined;
+  const lastDot = qualifiedName.lastIndexOf('.');
+  if (lastDot < 0) return undefined;
+  const parent = qualifiedName.slice(0, lastDot);
+  return getQualifiedSimpleName(parent);
+}
+
+function getQualifiedSimpleName(qualifiedName: string | undefined): string | undefined {
+  if (qualifiedName === undefined) return undefined;
+  const lastDot = qualifiedName.lastIndexOf('.');
+  return lastDot >= 0 ? qualifiedName.slice(lastDot + 1) : qualifiedName;
 }

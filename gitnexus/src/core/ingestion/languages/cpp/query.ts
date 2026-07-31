@@ -48,6 +48,12 @@ const CPP_SCOPE_QUERY = `
     (template_argument_list) @declaration.template-arguments)
   body: (field_declaration_list)) @declaration.struct
 
+;; Declarations — struct (typedef struct { ... } Name)
+(type_definition
+  type: (struct_specifier
+    body: (field_declaration_list))
+  declarator: (type_identifier) @declaration.name) @declaration.struct
+
 ;; ─── Declarations — class / struct inside template_declaration ───────
 (template_declaration
   (class_specifier
@@ -77,6 +83,12 @@ const CPP_SCOPE_QUERY = `
 (enum_specifier
   name: (type_identifier) @declaration.name) @declaration.enum
 
+;; ─── Declarations — enum (typedef enum { ... } Name) ─────────────────
+(type_definition
+  type: (enum_specifier
+    body: (enumerator_list))
+  declarator: (type_identifier) @declaration.name) @declaration.enum
+
 ;; ─── Declarations — enum constants ───────────────────────────────────
 (enumerator
   name: (identifier) @declaration.name) @declaration.const
@@ -85,6 +97,16 @@ const CPP_SCOPE_QUERY = `
 (function_definition
   declarator: (function_declarator
     declarator: (identifier) @declaration.name)) @declaration.function
+
+;; Lambda bindings (\`auto f = [](int x){ … };\`). The \`@declaration.function\`
+;; anchor sits on the INNER lambda_expression so its range aligns with
+;; \`(lambda_expression) @scope.function\` above; otherwise the def is owned by
+;; the enclosing scope and calls inside the lambda lose caller attribution.
+;; Mirrors the TypeScript arrow patterns (#2687).
+(declaration
+  declarator: (init_declarator
+    declarator: (identifier) @declaration.name
+    value: (lambda_expression) @declaration.function))
 
 ;; ─── Declarations — function definition with pointer return ─────────
 (function_definition
@@ -182,6 +204,29 @@ const CPP_SCOPE_QUERY = `
   declarator: (function_declarator
     declarator: (identifier) @declaration.name)) @declaration.function
 
+;; tree-sitter-cpp 0.23 represents a deleted free function as an
+;; init_declarator whose value is a delete_expression.
+(declaration
+  declarator: (init_declarator
+    declarator: (function_declarator
+      declarator: (identifier) @declaration.name)
+    value: (delete_expression))) @declaration.function
+
+;; Deleted free operator declaration.
+(declaration
+  declarator: (init_declarator
+    declarator: (function_declarator
+      declarator: (operator_name) @declaration.name)
+    value: (delete_expression))) @declaration.function
+
+;; Deleted free function with a pointer return type.
+(declaration
+  declarator: (init_declarator
+    declarator: (pointer_declarator
+      declarator: (function_declarator
+        declarator: (identifier) @declaration.name))
+    value: (delete_expression))) @declaration.function
+
 ;; Free operator prototype: std::ostream& operator<<(std::ostream&, T)
 (declaration
   declarator: (function_declarator
@@ -225,6 +270,12 @@ const CPP_SCOPE_QUERY = `
     declarator: (function_declarator
       declarator: (field_identifier) @declaration.name))) @declaration.method
 
+;; Constructor prototype in class body: User(int id);
+(field_declaration_list
+  (declaration
+    declarator: (function_declarator
+      declarator: (identifier) @declaration.name)) @declaration.method)
+
 ;; Method prototype with reference return: User& getRef();
 (field_declaration
   declarator: (reference_declarator
@@ -253,6 +304,15 @@ const CPP_SCOPE_QUERY = `
 ;; ─── Declarations — variables (with initializer) ────────────────────
 (declaration
   declarator: (init_declarator
+    declarator: (identifier) @declaration.name)) @declaration.variable
+
+;; ─── Declarations — variables (without initializer) ─────────────────
+;; Covers non-leading declarators in mixed declaration lists.
+(declaration
+  declarator: (identifier) @declaration.name) @declaration.variable
+
+(declaration
+  declarator: (pointer_declarator
     declarator: (identifier) @declaration.name)) @declaration.variable
 
 ;; ─── Declarations — macro definitions ───────────────────────────────

@@ -26,17 +26,20 @@ import {
 } from './index.js';
 
 const pythonScopeResolver: ScopeResolver = {
+  // A free call naming a class constructs it: `Service(db).do_work()` (#2708).
+  constructionSyntax: { bare: true },
   language: SupportedLanguages.Python,
   languageProvider: pythonProvider,
   importEdgeReason: 'python-scope: import',
 
   resolveImportTarget: (targetRaw, fromFile, allFilePaths) => {
-    // Copy the orchestrator's `ReadonlySet` into a `Set` because the
-    // legacy Python resolver chain (`resolvePythonImportInternal` →
-    // `resolveAbsoluteFromFiles` / `hasRepoCandidate`) is typed to
-    // receive a mutable `Set<string>`. The copy is O(N) but called
-    // once per import — trivial compared to the parser work.
-    const ws: PythonResolveContext = { fromFile, allFilePaths: new Set(allFilePaths) };
+    // Pass the orchestrator's stable run-level `ReadonlySet` straight through
+    // (no per-import copy). The Python resolver chain only reads the set, and
+    // `getPythonFileIndex` memoizes its index on the set's identity via a
+    // WeakMap — so the index is built once per run and reused across every
+    // import. Copying here (the previous `new Set(allFilePaths)`) handed a
+    // fresh identity to every import, defeating that cache (PR #1918 review P1).
+    const ws: PythonResolveContext = { fromFile, allFilePaths };
     // `WorkspaceIndex` is an opaque `unknown` placeholder in the
     // shared contract, so `ws` passes structurally without a cast.
     return resolvePythonImportTarget(

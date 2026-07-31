@@ -41,12 +41,14 @@
 import {
   buildClassRegistry,
   buildFieldRegistry,
+  buildMacroRegistry,
   buildMethodRegistry,
   CLASS_KINDS,
   FIELD_KINDS,
   METHOD_KINDS,
   type ClassRegistry,
   type FieldRegistry,
+  type MacroRegistry,
   type MethodRegistry,
   type Reference,
   type ReferenceIndex,
@@ -102,6 +104,7 @@ export function resolveReferenceSites(input: ResolveReferencesInput): ResolveRef
   const classRegistry = buildClassRegistry(ctx);
   const methodRegistry = buildMethodRegistry(ctx);
   const fieldRegistry = buildFieldRegistry(ctx);
+  const macroRegistry = buildMacroRegistry(ctx);
 
   // bySourceScope is the canonical index; byTargetDef is derived from it.
   const bySourceScope = new Map<ScopeId, Reference[]>();
@@ -112,9 +115,20 @@ export function resolveReferenceSites(input: ResolveReferencesInput): ResolveRef
   let unresolved = 0;
 
   for (const site of scopes.referenceSites) {
+    // value-ref sites resolve post-finalize (imports live in finalized
+    // bindings the registries can't see — same reason free calls need
+    // `emitFreeCallFallback`). `emitPropertyDispatchCalls` owns their
+    // resolution and emission entirely (#2437).
+    if (site.kind === 'value-ref') continue;
     sitesProcessed++;
 
-    const resolutions = lookupForSite(site, classRegistry, methodRegistry, fieldRegistry);
+    const resolutions = lookupForSite(
+      site,
+      classRegistry,
+      methodRegistry,
+      fieldRegistry,
+      macroRegistry,
+    );
     if (resolutions.length === 0) {
       unresolved++;
       continue;
@@ -165,6 +179,13 @@ export function resolveReferenceSites(input: ResolveReferencesInput): ResolveRef
  *   | `type-reference` | ClassRegistry     | CLASS_KINDS                  |
  *   | `read`/`write`   | FieldRegistry     | FIELD_KINDS                  |
  *   | `import-use`     | tiered fallback   | METHOD ∪ CLASS ∪ FIELD       |
+ *   | `value-ref`      | (skipped here)    | post-finalize walker in `emitPropertyDispatchCalls` |
+ *   | `macro`          | MacroRegistry     | MACRO_KINDS (`Macro` only)   |
+ *
+ * `macro` has its own single-kind registry so a macro invocation
+ * (`log!(…)`) resolves ONLY to a `macro_rules! log` definition and never
+ * to a same-named free function — macros and functions are disjoint
+ * namespaces (the false-`CALLS`-edge class flagged in the #1934 review).
  *
  * `import-use` doesn't have a single registry — the imported name might
  * be a class, a function, or a constant. Try each in priority order and
@@ -177,6 +198,7 @@ function lookupForSite(
   classRegistry: ClassRegistry,
   methodRegistry: MethodRegistry,
   fieldRegistry: FieldRegistry,
+  macroRegistry: MacroRegistry,
 ): readonly Resolution[] {
   switch (site.kind) {
     case 'call': {
@@ -212,6 +234,16 @@ function lookupForSite(
       const methodHits = methodRegistry.lookup(site.name, site.inScope);
       if (methodHits.length > 0) return methodHits;
       return fieldRegistry.lookup(site.name, site.inScope);
+    }
+    case 'value-ref': {
+      // Unreachable — filtered before lookup (post-finalize resolution in
+      // `emitPropertyDispatchCalls`, #2437). Kept for switch exhaustiveness.
+      return [];
+    }
+    case 'macro': {
+      // Macro-only namespace: resolves against `Macro`-labeled defs, never
+      // functions. No receiver, no arity — see `MacroRegistry`.
+      return macroRegistry.lookup(site.name, site.inScope);
     }
   }
 }

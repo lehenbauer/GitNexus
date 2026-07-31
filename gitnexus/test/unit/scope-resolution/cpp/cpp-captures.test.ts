@@ -7,6 +7,8 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { emitCppScopeCaptures } from '../../../../src/core/ingestion/languages/cpp/captures.js';
+import { cppProvider } from '../../../../src/core/ingestion/languages/c-cpp.js';
+import { extractParsedFile } from '../../../../src/core/ingestion/scope-extractor-bridge.js';
 import {
   clearFileLocalNames,
   isFileLocal,
@@ -105,6 +107,16 @@ describe('emitCppScopeCaptures — class declarations', () => {
     );
     expect(m).toBeDefined();
     expect(m!['@declaration.name'].text).toBe('Point');
+  });
+
+  it('captures typedef anonymous struct with @declaration.struct (not typedef)', () => {
+    const src = 'typedef struct { int x; int y; } Point;';
+    const m = findMatch(src, (t) => t.includes('@declaration.struct'));
+    expect(m).toBeDefined();
+    expect(m!['@declaration.name'].text).toBe('Point');
+
+    const typedefs = allMatches(src, (t) => t.includes('@declaration.typedef'));
+    expect(typedefs).toHaveLength(0);
   });
 
   it('captures template class with @declaration.class', () => {
@@ -212,6 +224,21 @@ describe('emitCppScopeCaptures — variable declarations', () => {
     expect(m).toBeDefined();
     expect(m!['@declaration.name'].text).toBe('x');
   });
+
+  it('captures all names in mixed initialized and uninitialized declarations', () => {
+    const matches = allMatches('void f() { int a = 1, b, *p, c = 3, d; }', (t) =>
+      t.includes('@declaration.variable'),
+    );
+    const names = matches.map((m) => m['@declaration.name'].text).sort();
+    expect(names).toEqual(['a', 'b', 'c', 'd', 'p']);
+  });
+
+  it('captures qualified-type multi-declarator variables', () => {
+    const src = 'namespace data { struct Pair {}; } void f() { data::Pair a, b; }';
+    const matches = allMatches(src, (t) => t.includes('@declaration.variable'));
+    const names = matches.map((m) => m['@declaration.name'].text).sort();
+    expect(names).toEqual(['a', 'b']);
+  });
 });
 
 // ── Declarations — enums ────────────────────────────────────────────────────
@@ -230,6 +257,16 @@ describe('emitCppScopeCaptures — enum declarations', () => {
     expect(matches.length).toBe(3);
     const names = matches.map((m) => m['@declaration.name'].text).sort();
     expect(names).toEqual(['Blue', 'Green', 'Red']);
+  });
+
+  it('captures typedef anonymous enum with @declaration.enum (not typedef)', () => {
+    const src = 'typedef enum { Red, Green, Blue } Color;';
+    const m = findMatch(src, (t) => t.includes('@declaration.enum'));
+    expect(m).toBeDefined();
+    expect(m!['@declaration.name'].text).toBe('Color');
+
+    const typedefs = allMatches(src, (t) => t.includes('@declaration.typedef'));
+    expect(typedefs).toHaveLength(0);
   });
 });
 
@@ -389,6 +426,72 @@ describe('emitCppScopeCaptures — arity enrichment', () => {
     expect(m!['@declaration.parameter-count'].text).toBe('2');
   });
 
+  it('tags deleted declarations but not defaulted declarations', () => {
+    const deleted = findMatch('void foo(int) = delete;', (tags) =>
+      tags.includes('@declaration.is-deleted'),
+    );
+    const defaulted = emitCppScopeCaptures('struct S { S() = default; };', 'test.cpp').find(
+      (match) => Object.values(match).some((capture) => capture.text.includes('= default')),
+    );
+
+    expect(deleted?.['@declaration.is-deleted'].text).toBe('true');
+    expect(defaulted).toBeDefined();
+    expect(defaulted?.['@declaration.is-deleted']).toBeUndefined();
+  });
+
+  it('tags deleted free operators', () => {
+    const deleted = findMatch(
+      'struct S {}; bool operator==(const S&, const S&) = delete;',
+      (tags) => tags.includes('@declaration.is-deleted'),
+    );
+
+    expect(deleted?.['@declaration.name'].text).toBe('operator==');
+    expect(deleted?.['@declaration.is-deleted'].text).toBe('true');
+  });
+
+  it('tags deleted pointer-return free functions', () => {
+    const deleted = findMatch('int* lookup(int) = delete;', (tags) =>
+      tags.includes('@declaration.is-deleted'),
+    );
+
+    expect(deleted?.['@declaration.name'].text).toBe('lookup');
+    expect(deleted?.['@declaration.is-deleted'].text).toBe('true');
+  });
+
+  it('does not borrow a deleted initializer from another declarator', () => {
+    const declarations = allMatches('void f(int), g = delete(new int);', (tags) =>
+      tags.includes('@declaration.function'),
+    );
+    const f = declarations.find((match) => match['@declaration.name']?.text === 'f');
+
+    expect(f).toBeDefined();
+    expect(f?.['@declaration.is-deleted']).toBeUndefined();
+  });
+
+  it('preserves deleted-callable metadata in parsed local definitions', () => {
+    const parsed = extractParsedFile(
+      cppProvider,
+      `
+        void choose(int) = delete;
+        struct S {
+          S() = default;
+          void touch(double) = delete;
+        };
+      `,
+      'test.cpp',
+    );
+
+    const choose = parsed?.localDefs.find((def) => def.qualifiedName === 'choose');
+    const touch = parsed?.localDefs.find((def) => def.qualifiedName === 'touch');
+    const constructor = parsed?.localDefs.find(
+      (def) => def.type === 'Constructor' && def.qualifiedName === 'S',
+    );
+
+    expect(choose?.isDeleted).toBe(true);
+    expect(touch?.isDeleted).toBe(true);
+    expect(constructor?.isDeleted).not.toBe(true);
+  });
+
   it('enriches call reference with arity', () => {
     const src = 'void f() { foo(1, 2, 3); }';
     const m = findMatch(src, (t) => t.includes('@reference.arity'));
@@ -422,5 +525,38 @@ describe('emitCppScopeCaptures — file-local linkage', () => {
   it('does not mark function in named namespace as file-local', () => {
     emitCppScopeCaptures('namespace foo { void helper() {} }', 'test.cpp');
     expect(isFileLocal('test.cpp', 'helper')).toBe(false);
+  });
+});
+
+describe('emitCppScopeCaptures — callable-flow passing modes (#2522 review, M5)', () => {
+  function modesFor(src: string): Record<string, string | undefined> {
+    const out: Record<string, string | undefined> = {};
+    for (const m of emitCppScopeCaptures(src, 'modes.cpp')) {
+      const binding = m['@callable-flow.binding']?.text;
+      if (m['@callable-flow.formal'] === undefined || binding === undefined) continue;
+      out[`${m['@callable-flow.owner']?.text}.${binding}`] = m['@callable-flow.passing-mode']?.text;
+    }
+    return out;
+  }
+
+  it('classifies by the outermost declarator chain, never nested parameter lists', () => {
+    const modes = modesFor(
+      [
+        'void reg(void (*cb)(int& out)) {}',
+        'void take(int& v) {}',
+        'void raw(int* p) {}',
+        'void val(int v) {}',
+        'void refptr(void (*&cb)(int)) {}',
+      ].join('\n'),
+    );
+    expect(modes).toMatchObject({
+      // by-value pointer copy — the nested `int&` must not make it an alias
+      'reg.cb': 'pointer',
+      'take.v': 'reference',
+      'raw.p': 'pointer',
+      'val.v': 'value',
+      // reference-to-pointer IS an alias
+      'refptr.cb': 'reference',
+    });
   });
 });

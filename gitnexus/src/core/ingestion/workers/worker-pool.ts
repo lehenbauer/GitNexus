@@ -1,5 +1,6 @@
 import { Worker } from 'node:worker_threads';
 import os from 'node:os';
+import { effectiveRamBytes } from '../utils/effective-ram.js';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -102,13 +103,15 @@ export interface WorkerPool {
    *
    * Files in {@link WorkerPool.getQuarantinedPaths} are filtered out before
    * dispatch — they have already caused a worker death this pool lifetime and
-   * are not safe to re-attempt in workers. The caller is responsible for
-   * routing them (e.g. to sequential fallback); inspect the quarantine
-   * snapshot before and after each dispatch.
+   * are not safe to re-attempt in workers. They are dropped from the run (the
+   * sequential fallback that once re-parsed them was removed); inspect the
+   * quarantine snapshot before and after each dispatch to surface skipped files
+   * in diagnostics.
    */
   dispatch<TInput, TResult>(
     items: TInput[],
     onProgress?: (filesProcessed: number) => void,
+    chunkHash?: string,
   ): Promise<TResult[]>;
 
   /** Terminate all workers. Must be called when done. */
@@ -192,8 +195,8 @@ export interface WorkerPoolOptions {
    * Hard ceiling on total wall time the pool will spend retrying / splitting
    * any single job. Combined with `timeoutBackoffFactor`, this prevents
    * exponentially-growing retry waits from accumulating into multi-hour
-   * stalls before the pool finally surfaces the bad file to sequential
-   * fallback. Default 5x `subBatchIdleTimeoutMs`.
+   * stalls before the pool finally quarantines the bad file and proceeds
+   * without it. Default 5x `subBatchIdleTimeoutMs`.
    */
   maxCumulativeTimeoutMs?: number;
   /**
@@ -204,11 +207,74 @@ export interface WorkerPoolOptions {
    */
   consecutiveFailureThreshold?: number;
   /**
+   * Startup budget in milliseconds for a replacement worker to emit the
+   * `{type:'ready'}` handshake before the pool treats it as a startup
+   * crash (see {@link waitForWorkerReady}). Default 5000; also overridable
+   * via `GITNEXUS_WORKER_READY_TIMEOUT_MS`, mirroring
+   * `GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS`. On a slow or heavily loaded
+   * host, a full pool of workers cold-starting concurrently can
+   * legitimately need more than 5s to load the native grammar bindings —
+   * without the override every slot times out and the pool misclassifies
+   * the slow start as a deterministic startup crash-loop, aborting the
+   * whole analyze.
+   */
+  workerReadyTimeoutMs?: number;
+  /**
    * Test-only injection point for the Worker constructor. When provided,
    * the pool uses this factory instead of `new Worker(workerUrl)`. Production
    * code should leave this unset.
    */
   workerFactory?: (workerUrl: URL) => Worker;
+  /**
+   * Test-only injection point for the main-thread stall probe (#2649):
+   * returns cumulative event-loop stall in ms. When provided, the pool
+   * skips its heartbeat tracker and reads this instead. Production code
+   * should leave this unset.
+   */
+  stallMsProbe?: () => number;
+  /**
+   * Storage path for the disk-backed ParsedFile store (#1983 parallel
+   * serialization). When set, it is baked into every spawned worker's
+   * `workerData` so the worker writes its own ParsedFile shards to disk
+   * instead of returning them over the MessageChannel for the main thread to
+   * serialize. Immutable for the run; captured in the default factory closure
+   * so RESPAWNED workers inherit it automatically (all spawn sites reuse the
+   * same factory). `undefined` ⇒ workers fall back to returning ParsedFiles in
+   * the result (small-repo / no-storage path).
+   */
+  parsedFileStoreStoragePath?: string;
+  /**
+   * Directory for the DURABLE, content-addressed ParsedFile store
+   * (`getDurableParsedFileDir`). When set (alongside a chunk hash on the
+   * dispatch), the worker ALSO writes its ParsedFiles to a content-addressed
+   * shard keyed by chunk hash so a future warm parse-cache hit can restore
+   * them without re-parsing (#2038 warm-cache coverage). Baked into every
+   * worker's `workerData` exactly like {@link parsedFileStoreStoragePath}.
+   * `undefined` ⇒ no durable write.
+   */
+  durableParsedFileStoragePath?: string;
+  /**
+   * CFG/PDG opt-in (#2081 M1). Baked into every spawned worker's `workerData`
+   * (like the store paths above); when `true`, workers build a per-function
+   * control-flow graph from the tree-sitter AST and attach it to
+   * `ParsedFile.cfgSideChannel`. `undefined`/`false` ⇒ no CFG work.
+   */
+  pdg?: boolean;
+  /** Per-function source-line cap for worker-side CFG construction (0 ⇒ no cap). */
+  pdgMaxFunctionLines?: number;
+  /**
+   * Max wall time `terminate()` waits for a retired worker that has NOT yet
+   * reached a JS-visible safe point before giving up on terminating it
+   * (#2432). Terminating a worker thread that is inside an N-API call aborts
+   * the whole process (`Napi::Error` → `std::terminate` → SIGABRT) — and the
+   * same abort fires at plain process exit, so the drain is what makes
+   * shutdown safe. On expiry the worker is left running (unref'd, with its
+   * at-safe-point terminate listener still armed) and a diagnostic is logged.
+   * Default 30000ms — above the C++ capture budget
+   * (`GITNEXUS_CPP_CAPTURE_BUDGET_MS`, 20000ms) so the drain converges for
+   * the known pathological class. 0 ⇒ no wait (test hook).
+   */
+  shutdownDrainMs?: number;
 }
 
 export class WorkerPoolDispatchError extends Error {
@@ -235,17 +301,50 @@ export class WorkerPoolDispatchError extends Error {
   }
 }
 
+/**
+ * How a total worker-startup failure was classified by the pool's bounded
+ * self-heal (#1741). Lets the caller render an accurate cause without
+ * inspecting any operator flag:
+ *  - 'deterministic-startup': ≥2 fresh workers crashed with the SAME signature
+ *    before any reached ready (e.g. a missing native binding) — retrying is
+ *    futile, so the pool short-circuited fast.
+ *  - 'transient-exhausted': workers crashed variably and exhausted the bounded
+ *    startup retry budget without ever reaching ready.
+ */
+export type StartupCrashClass = 'deterministic-startup' | 'transient-exhausted';
+
 export class WorkerPoolInitializationError extends WorkerPoolDispatchError {
   readonly readinessFailures: readonly string[];
+  /** Pool's automatic classification of the startup crash (#1741). */
+  readonly crashClass: StartupCrashClass;
 
   constructor(
     message: string,
     quarantinedPaths: readonly string[] = [],
     readinessFailures: readonly string[] = [],
+    crashClass: StartupCrashClass = 'transient-exhausted',
   ) {
     super(message, quarantinedPaths);
     this.name = 'WorkerPoolInitializationError';
     this.readinessFailures = readinessFailures;
+    this.crashClass = crashClass;
+  }
+}
+
+/**
+ * Thrown when a caller asks GitNexus to parse without the worker pool —
+ * `--workers 0`, `GITNEXUS_WORKER_POOL_SIZE=0`, or `skipWorkers: true`.
+ *
+ * GitNexus no longer has a sequential parser: the worker pool (with its
+ * quarantine + respawn/recycle + circuit-breaker resilience) is the SOLE
+ * parse path. These channels used to select an in-process fallback; they are
+ * now hard configuration errors so the operator gets an actionable message
+ * instead of silently parsing through a (deleted) slower path.
+ */
+export class WorkerPoolDisabledError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'WorkerPoolDisabledError';
   }
 }
 
@@ -254,7 +353,15 @@ type WorkerOutgoingMessage =
   | { type: 'progress'; filesProcessed: number }
   | { type: 'warning'; message: string }
   | { type: 'sub-batch-done' }
-  | { type: 'error'; error: string }
+  /**
+   * Worker-side caught error. `error` is the message; `errorStack` carries the
+   * worker thread's stack so the pool can embed a real file:line into its
+   * death / circuit-breaker reason instead of surfacing a bare one-liner (the
+   * #2068 diagnosability gap). `errorStack` is optional so an older worker
+   * build that only sends `error` still validates and degrades to message-only
+   * — and a newer pool reading it just gets no stack.
+   */
+  | { type: 'error'; error: string; errorStack?: string }
   | { type: 'result'; data: unknown }
   /**
    * Authoritative in-flight signal: worker is about to process this file.
@@ -282,6 +389,16 @@ interface WorkerJob<TInput> {
   estimatedBytes: number;
   attempt: number;
   splitDepth: number;
+  /**
+   * Content hash of the parse chunk these items belong to (when the caller
+   * dispatches per content-addressed chunk). Threaded into the worker's
+   * `flush` message so the worker can additionally write a durable,
+   * content-addressed ParsedFile shard for warm-cache reuse. Carried through
+   * every job-derivation site (split/requeue) so a split sub-job still tags
+   * its durable shard with the chunk hash. `undefined` ⇒ no durable write
+   * (tests / no-cache / no storage path).
+   */
+  chunkHash?: string;
   timeoutMs: number;
   /**
    * Running total of timeoutMs across all attempts/splits/respawn-retries
@@ -310,17 +427,7 @@ const DEFAULT_TIMEOUT_BACKOFF_FACTOR = 2;
 const DEFAULT_MAX_RESPAWNS_PER_SLOT = 3;
 const DEFAULT_MAX_CUMULATIVE_TIMEOUT_FACTOR = 5;
 const DEFAULT_CONSECUTIVE_FAILURE_THRESHOLD_FLOOR = 3;
-/**
- * Bounded wait for a replacement worker to emit the `{type:'ready'}`
- * handshake from `parse-worker.ts`. Trusting Node's `online` event alone
- * lets a worker that crashes during top-of-script init slip past pool
- * startup — the pool only notices on the first dispatch's idle timeout
- * (default 30s). 5 seconds is a generous budget for parser + grammar
- * imports; if the worker hasn't reported ready by then, it's almost
- * certainly stuck or crashed and the pool should surface the failure
- * fast rather than wait out the dispatch idle timeout.
- */
-const WORKER_READY_TIMEOUT_MS = 5_000;
+const DEFAULT_WORKER_READY_TIMEOUT_MS = 5_000;
 /**
  * Default upper bound on auto-resolved pool size. Past 16 workers the
  * dominant cost shifts from worker-side parsing to main-thread merge /
@@ -330,6 +437,99 @@ const WORKER_READY_TIMEOUT_MS = 5_000;
  * `GITNEXUS_WORKER_POOL_SIZE` or `--workers <N>`.
  */
 const DEFAULT_POOL_SIZE_CAP = 16;
+
+// ── Self-healing startup restart policy (#1741) ──────────────────────────────
+// A worker that crashes during top-of-script init (broken native binding, bad
+// import) is retried a BOUNDED number of times with jittered backoff before
+// its slot is dropped, so a transient blip self-heals with no operator
+// intervention. The bound is the whole point of #1741: recovery must never
+// become a silent, unbounded "stuck" run. When the budget is exhausted (or a
+// deterministic crash-loop is detected), the slot is dropped; if every slot is
+// dropped the first dispatch fails fast with the captured cause.
+/** Retries beyond the first attempt, per slot, to bring a startup worker ready. */
+const STARTUP_RESTART_BUDGET = 2;
+const RESTART_BACKOFF_BASE_MS = 250;
+const RESTART_BACKOFF_CAP_MS = 2_000;
+/**
+ * When this many freshly-spawned workers crash with the SAME crash signature
+ * before ANY worker reaches the `{type:'ready'}` handshake, the failure is
+ * deterministic (the #1741 missing-binding case: every worker prints a
+ * byte-identical native-binding stack). The pool stops retrying immediately
+ * instead of burning every slot's budget, and fails fast with the cause.
+ */
+const DETERMINISTIC_STARTUP_FINGERPRINT_THRESHOLD = 2;
+
+/**
+ * Capped exponential backoff with FULL jitter (AWS "Exponential Backoff And
+ * Jitter"): random(0, min(CAP, BASE·2^attempt)). Full jitter de-synchronizes
+ * the N workers that crash near-simultaneously on a shared startup fault so
+ * their respawns don't re-storm in lockstep (Google SRE thundering herd).
+ */
+function startupBackoffMs(attempt: number): number {
+  const ceil = Math.min(RESTART_BACKOFF_CAP_MS, RESTART_BACKOFF_BASE_MS * 2 ** attempt);
+  return Math.floor(Math.random() * (ceil + 1));
+}
+
+/**
+ * Sleep used between startup self-heal retries. The timer is intentionally NOT
+ * `unref`'d: a pending retry is necessary work, so it must keep the event loop
+ * alive long enough to actually respawn — otherwise a pool whose only live work
+ * is a startup backoff could let the process exit mid-recovery (#1741). To
+ * avoid wedging shutdown, the timer registers a cancel function in `pending`;
+ * `terminate()` invokes those cancels to `clearTimeout` and resolve early, and
+ * a normally-fired timer removes its own cancel. `aborted()` is checked once up
+ * front; the CALLER re-checks after wake (it owns the terminated/deterministic
+ * decision) — this function does not itself re-evaluate abort on wake.
+ */
+function abortableSleep(
+  ms: number,
+  aborted: () => boolean,
+  pending: Set<() => void>,
+): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (ms <= 0 || aborted()) {
+      resolve();
+      return;
+    }
+    // `cancel` is registered so terminate() can clear a pending backoff; it is
+    // also the timer's own callback, so a normally-fired sleep self-deregisters.
+    const cancel = () => {
+      clearTimeout(timer);
+      pending.delete(cancel);
+      resolve();
+    };
+    const timer = setTimeout(cancel, ms);
+    pending.add(cancel);
+  });
+}
+
+/**
+ * Normalize a worker crash message into a stable signature so two instances of
+ * the SAME deterministic crash compare equal while unrelated crashes don't.
+ * Strips hex addresses, digit runs (pids / line numbers / timestamps) and
+ * absolute paths. Best-effort by design: the deterministic classification's
+ * correctness rests on the STRUCTURAL signal (zero workers ever ready + startup
+ * budget exhausted), so an imperfect signature only changes how fast the
+ * short-circuit fires, never whether the pool ultimately fails fast. Even a
+ * stderr-less crash normalizes its "exited with code N" message to a stable
+ * key, so the empty-stderr timing case still groups.
+ *
+ * @internal Exported for unit tests; production callers are in this module.
+ */
+export function crashSignature(message: string): string {
+  return (
+    message
+      .replace(/0x[0-9a-fA-F]+/g, '0xADDR') // 0x-prefixed addresses
+      // Windows backslash paths (optional drive letter), e.g. C:\Users\ci\Temp\w-7f3a.js
+      .replace(/(?:[A-Za-z]:)?(?:\\[^\s\\'"]+)+/g, '\\PATH')
+      .replace(/(?:\/[^\s:'"]+)+/g, '/PATH') // POSIX paths
+      .replace(/\b[0-9a-fA-F]{6,}\b/g, 'HEX') // bare hex runs (ASLR addrs / backtrace tokens)
+      .replace(/[0-9]+/g, 'N') // pids / line numbers / exit codes / timestamps
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 300)
+  );
+}
 
 function positiveInteger(value: unknown): number | undefined {
   const parsed = typeof value === 'string' ? Number(value) : value;
@@ -345,6 +545,9 @@ function nonNegativeInteger(value: unknown): number | undefined {
     : undefined;
 }
 
+/** See {@link WorkerPoolOptions.shutdownDrainMs}. */
+const DEFAULT_SHUTDOWN_DRAIN_MS = 30_000;
+
 interface ResolvedWorkerPoolOptions {
   subBatchSize: number;
   subBatchMaxBytes: number;
@@ -354,6 +557,8 @@ interface ResolvedWorkerPoolOptions {
   maxRespawnsPerSlot: number;
   maxCumulativeTimeoutMs: number;
   consecutiveFailureThreshold: number;
+  shutdownDrainMs: number;
+  workerReadyTimeoutMs: number;
 }
 
 export function resolveWorkerPoolOptions(
@@ -386,15 +591,49 @@ export function resolveWorkerPoolOptions(
       positiveInteger(options.consecutiveFailureThreshold) ??
       positiveInteger(process.env.GITNEXUS_WORKER_CONSECUTIVE_FAILURE_THRESHOLD) ??
       Math.max(DEFAULT_CONSECUTIVE_FAILURE_THRESHOLD_FLOOR, poolSize ?? 0),
+    shutdownDrainMs:
+      nonNegativeInteger(options.shutdownDrainMs) ??
+      nonNegativeInteger(process.env.GITNEXUS_WORKER_SHUTDOWN_DRAIN_MS) ??
+      DEFAULT_SHUTDOWN_DRAIN_MS,
+    workerReadyTimeoutMs:
+      positiveInteger(options.workerReadyTimeoutMs) ??
+      positiveInteger(process.env.GITNEXUS_WORKER_READY_TIMEOUT_MS) ??
+      DEFAULT_WORKER_READY_TIMEOUT_MS,
   };
+}
+
+/**
+ * The pool size requested via the `GITNEXUS_WORKER_POOL_SIZE` env var, or
+ * `undefined` when unset, empty/whitespace, or invalid. Module-internal sizing
+ * reader consumed by {@link resolveAutoPoolSize} (the env override) and
+ * {@link workerPoolDisabledByEnv} (the disabled-channel check). Reads only —
+ * never mutates `process.env`. Empty/whitespace is treated as *unset* (falls
+ * through to the auto formula), not as 0 — an empty assignment (`export
+ * GITNEXUS_WORKER_POOL_SIZE=`) is an accident, not a request for zero workers;
+ * only a literal `0` disables the pool.
+ */
+function envWorkerPoolSize(): number | undefined {
+  const raw = process.env.GITNEXUS_WORKER_POOL_SIZE;
+  if (raw === undefined || raw.trim() === '') return undefined;
+  return nonNegativeInteger(raw);
+}
+
+/**
+ * True when the operator set `GITNEXUS_WORKER_POOL_SIZE=0` — the env-channel
+ * equivalent of `--workers 0`. The parse phase consults this (only when no
+ * explicit `--workers <N>` was passed) and HARD-ERRORS: sequential parsing was
+ * removed, so a disabled pool is an actionable configuration error, not a
+ * silent fallback. An explicit positive `--workers N` always wins.
+ */
+export function workerPoolDisabledByEnv(): boolean {
+  return envWorkerPoolSize() === 0;
 }
 
 /**
  * Resolve the auto-default worker pool size when no explicit `poolSize`
  * arg is passed to `createWorkerPool`. Precedence:
  *
- * 1. `GITNEXUS_WORKER_POOL_SIZE` env var (operator override; set by
- *    `--workers <N>` on the CLI).
+ * 1. `GITNEXUS_WORKER_POOL_SIZE` env var (operator override).
  * 2. `os.cpus().length - 1`, clamped to `[1, DEFAULT_POOL_SIZE_CAP]`.
  *
  * The cap exists because past ~16 workers the main-thread merge /
@@ -407,7 +646,7 @@ export function resolveWorkerPoolOptions(
  * on the env / default.
  */
 export function resolveAutoPoolSize(): number {
-  const envOverride = nonNegativeInteger(process.env.GITNEXUS_WORKER_POOL_SIZE);
+  const envOverride = envWorkerPoolSize();
   if (envOverride !== undefined) return envOverride;
   // Prefer os.availableParallelism (Node 18.14+) so cgroup CPU limits
   // (containers, taskset-restricted runtimes, CI runners with explicit
@@ -423,6 +662,95 @@ export function resolveAutoPoolSize(): number {
 }
 
 /**
+ * Max characters of a worker's stderr retained for crash diagnostics. A
+ * native-binding load failure or a top-of-script throw prints a stack to
+ * stderr; we keep the tail so `waitForWorkerReady` can attach the real
+ * reason to its rejection instead of the generic "did not report ready".
+ */
+const WORKER_STDERR_TAIL_LIMIT = 4000;
+
+/**
+ * Per-worker captured stderr tail. Populated only for workers spawned with
+ * `{ stderr: true }` (the production factory below). Test-injected workers
+ * via `workerFactory` typically inherit the parent's stderr and have no
+ * `worker.stderr` stream — those are simply skipped (empty tail). A WeakMap
+ * so the buffer is released when the worker is GC'd.
+ */
+const workerStderrTails = new WeakMap<Worker, { text: string }>();
+
+/**
+ * Tee a worker's stderr into a bounded in-memory tail (for surfacing the
+ * real crash on a startup failure) while still mirroring it to the parent
+ * process's stderr — preserving the live-diagnostics behavior workers had
+ * when they inherited stderr, before `{ stderr: true }` redirected it to a
+ * stream. No-op when the worker has no `stderr` stream (test factories).
+ */
+function captureWorkerStderr(worker: Worker): void {
+  const stream = worker.stderr;
+  if (!stream) return;
+  const buf = { text: '' };
+  workerStderrTails.set(worker, buf);
+  stream.on('data', (chunk: Buffer | string) => {
+    const s = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+    process.stderr.write(s);
+    buf.text = (buf.text + s).slice(-WORKER_STDERR_TAIL_LIMIT);
+  });
+  // A stderr stream error must never crash the pool.
+  stream.on('error', () => undefined);
+}
+
+/**
+ * Forward a worker's piped stdout to the parent process's stdout, so worker
+ * logs stay visible now that the production factory spawns with
+ * `{ stdout: true }`. Workers with INHERITED stdout have been observed to
+ * crash silently during top-of-script init (exit code 1, nothing on stderr,
+ * roughly half of a concurrently spawned pool) on macOS 26.5 under both
+ * Node 22 and 26; piping stdout eliminates the crash entirely. Piping also
+ * matches the existing stderr handling, so worker output no longer races the
+ * parent's raw fd. No-op when the worker has no `stdout` stream (test
+ * factories).
+ */
+function forwardWorkerStdout(worker: Worker): void {
+  const stream = worker.stdout;
+  if (!stream) return;
+  stream.on('data', (chunk: Buffer | string) => {
+    process.stdout.write(chunk);
+  });
+  // A stdout stream error must never crash the pool.
+  stream.on('error', () => undefined);
+}
+
+/** Captured stderr tail for a worker, trimmed; '' when nothing was captured. */
+function workerStderrTail(worker: Worker): string {
+  return workerStderrTails.get(worker)?.text.trim() ?? '';
+}
+
+/** Append the worker's captured stderr to a readiness-failure message. */
+function withStderr(worker: Worker, message: string): string {
+  const tail = workerStderrTail(worker);
+  return tail ? `${message}. Worker stderr:\n${tail}` : message;
+}
+
+/**
+ * Build a worker-death reason string that carries the worker-side stack when one
+ * is available (#2068). The stack is appended AFTER the `Worker N error: <msg>`
+ * prefix so every prefix/substring consumer downstream — recoverAndResume →
+ * handleWorkerDeath → the circuit-breaker `WorkerPoolDispatchError` message, and
+ * the tests that regex-match those — keeps working unchanged, while the operator
+ * now gets the real frame instead of a bare one-liner. The stack's first line is
+ * normally the message itself; keeping both is harmless and the indented block
+ * scans cleanly in a log. The stack is capped at WORKER_STDERR_TAIL_LIMIT,
+ * mirroring the sibling stderr-tail bound, so a pathological error type (or a
+ * raised `Error.stackTraceLimit`) can't bloat the death reason. `stack` is
+ * `undefined` for an older worker build (or a thrown non-Error), in which case
+ * the reason is exactly the prior message-only form.
+ */
+function workerErrorReason(workerIndex: number, message: string, stack?: string): string {
+  const base = `Worker ${workerIndex} error: ${message}`;
+  return stack ? `${base}\n  worker stack:\n${stack.slice(0, WORKER_STDERR_TAIL_LIMIT)}` : base;
+}
+
+/**
  * Wait for a freshly-spawned replacement worker to emit the
  * `{type:'ready'}` handshake from `parse-worker.ts` before treating its
  * slot as dispatch-ready. Trusting Node's `online` event alone (which
@@ -431,13 +759,14 @@ export function resolveAutoPoolSize(): number {
  * (parser/grammar import failure, missing native binding) slip past
  * pool startup. The pool then only noticed the dead replacement on the
  * first dispatch's idle timeout (default 30s) — a long stall masking
- * an actual crash. This handshake bounds the wait at
- * {@link WORKER_READY_TIMEOUT_MS} and surfaces init failures as
- * `error` / `exit` / `messageerror` events directly. `messageerror` is
- * wired the same way: a V8 deserialization failure during startup is
- * treated as worker death and rejects the readiness promise.
+ * an actual crash. This handshake bounds the wait at `readyTimeoutMs`
+ * (see {@link WorkerPoolOptions.workerReadyTimeoutMs}) and surfaces init
+ * failures as `error` / `exit` / `messageerror` events directly.
+ * `messageerror` is wired the same way: a V8 deserialization failure
+ * during startup is treated as worker death and rejects the readiness
+ * promise.
  */
-function waitForWorkerReady(worker: Worker): Promise<void> {
+function waitForWorkerReady(worker: Worker, readyTimeoutMs: number): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const cleanup = () => {
       clearTimeout(timer);
@@ -458,16 +787,27 @@ function waitForWorkerReady(worker: Worker): Promise<void> {
     };
     const onError = (err: Error) => {
       cleanup();
-      reject(err);
+      // The 'error' event carries the real top-of-script exception; enrich it
+      // with the worker's stderr tail (native-binding stacks land there).
+      reject(new Error(withStderr(worker, err.message)));
     };
     const onExit = (code: number) => {
       cleanup();
-      reject(new Error(`Replacement worker exited with code ${code} before reporting ready`));
+      reject(
+        new Error(
+          withStderr(worker, `Replacement worker exited with code ${code} before reporting ready`),
+        ),
+      );
     };
     const onMessageError = (err: Error) => {
       cleanup();
       reject(
-        new Error(`Replacement worker emitted messageerror before reporting ready: ${err.message}`),
+        new Error(
+          withStderr(
+            worker,
+            `Replacement worker emitted messageerror before reporting ready: ${err.message}`,
+          ),
+        ),
       );
     };
     // `timer` is declared after `cleanup` so the cleanup closure can reference
@@ -477,10 +817,13 @@ function waitForWorkerReady(worker: Worker): Promise<void> {
       cleanup();
       reject(
         new Error(
-          `Replacement worker did not report ready within ${WORKER_READY_TIMEOUT_MS}ms — likely crashed during top-of-script init`,
+          withStderr(
+            worker,
+            `Replacement worker did not report ready within ${readyTimeoutMs}ms — likely crashed during top-of-script init (slow host? raise GITNEXUS_WORKER_READY_TIMEOUT_MS; repeated on a large repo? likely main-thread memory pressure — see the "Analysis runs out of memory" README section, #2649)`,
+          ),
         ),
       );
-    }, WORKER_READY_TIMEOUT_MS);
+    }, readyTimeoutMs);
     worker.on('message', onMessage);
     worker.once('error', onError);
     worker.once('exit', onExit);
@@ -525,6 +868,7 @@ function createJobs<TInput>(
   maxItems: number,
   maxBytes: number,
   timeoutMs: number,
+  chunkHash?: string,
 ): WorkerJob<TInput>[] {
   const jobs: WorkerJob<TInput>[] = [];
   let startIndex = 0;
@@ -539,6 +883,7 @@ function createJobs<TInput>(
       estimatedBytes: batchBytes,
       attempt: 0,
       splitDepth: 0,
+      chunkHash,
       timeoutMs,
       cumulativeTimeoutMs: timeoutMs,
     });
@@ -581,7 +926,60 @@ function createJobs<TInput>(
  *   time spent across all attempts/splits/retries. When the budget is
  *   exhausted, the pool surfaces the in-flight path via `WorkerPoolDispatchError`
  *   instead of letting timeouts compound indefinitely.
+ *
+ * Upstream of these layers, the parse worker self-sanitizes a result that the
+ * structured-clone algorithm can't serialize (#2112) — stripping or dropping
+ * the offending value and reporting the affected paths on the result — so a
+ * single non-cloneable value can't masquerade as a worker death and exhaust a
+ * slot's respawn budget here.
  */
+
+/**
+ * Main-thread stall tracking (#2649). Near the V8 heap limit, multi-second
+ * mark-compact pauses freeze the main thread's message processing, so a
+ * healthy worker's `progress` messages sit unread and the worker LOOKS idle —
+ * the idle-timeout path then splits/retires it, and the respawn storm ends in
+ * "Replacement worker did not report ready". A 250ms unref'd heartbeat
+ * accumulates observed event-loop drift; the idle-timeout handler credits
+ * that stall once per job instead of retiring a worker the main thread
+ * starved. The floor filters scheduler jitter from real stalls.
+ */
+const HEARTBEAT_INTERVAL_MS = 250;
+const HEARTBEAT_STALL_FLOOR_MS = 100;
+/** Fraction of the idle-timeout budget that must be main-thread stall before
+ *  the timeout is credited and re-armed instead of acted on. */
+const STALL_CREDIT_FRACTION = 0.5;
+
+export function startHeartbeatStallTracker(): { read: () => number; stop: () => void } {
+  let totalStallMs = 0;
+  let last = Date.now();
+  const handle = setInterval(() => {
+    const now = Date.now();
+    const drift = now - last - HEARTBEAT_INTERVAL_MS;
+    if (drift > HEARTBEAT_STALL_FLOOR_MS) totalStallMs += drift;
+    last = now;
+  }, HEARTBEAT_INTERVAL_MS);
+  handle.unref?.();
+  return { read: () => totalStallMs, stop: () => clearInterval(handle) };
+}
+
+/**
+ * Per-worker V8 old-generation heap cap in MB (#2649). Without one, worker
+ * isolates inherit an unbounded default and a full pool can inflate process
+ * RSS past physical RAM on large repos. Half of RAM split across the pool,
+ * clamped to [512, 4096] MB — generous for the per-sub-batch working set
+ * (jobs are byte-budgeted), and a worker that does exceed it dies with a
+ * real heap error surfaced by the stderr-tail machinery + the
+ * quarantine/respawn path, instead of silently dragging the host into swap.
+ * `GITNEXUS_WORKER_HEAP_MB` overrides the formula. Exported for unit tests.
+ */
+export function resolveWorkerHeapCapMb(poolSize: number): number {
+  return (
+    positiveInteger(process.env.GITNEXUS_WORKER_HEAP_MB) ??
+    Math.min(4096, Math.max(512, Math.floor(effectiveRamBytes() / (1024 * 1024) / 2 / poolSize)))
+  );
+}
+
 export const createWorkerPool = (
   workerUrl: URL,
   poolSize?: number,
@@ -596,8 +994,88 @@ export const createWorkerPool = (
 
   const size = poolSize ?? resolveAutoPoolSize();
   const poolOptions = resolveWorkerPoolOptions(options, size);
-  const spawnWorker = options?.workerFactory ?? ((url: URL) => new Worker(url));
+  // Production factory spawns with `{ stderr: true }` so a worker's crash
+  // output is redirected to a `worker.stderr` stream we can tee + capture
+  // (see captureWorkerStderr) and attach to readiness-failure messages —
+  // instead of the generic "did not report ready" that hid the real cause
+  // in #1741. Test factories (workerFactory) are used verbatim.
+  // Bake the (immutable) ParsedFile store path into the factory closure so it
+  // reaches EVERY spawned worker — including respawns, which reuse this same
+  // factory — via `workerData`, read once at worker init. The `(url) => Worker`
+  // signature is unchanged so the zero-arg test factories keep working.
+  const parsedFileStoreStoragePath = options?.parsedFileStoreStoragePath;
+  const durableParsedFileStoragePath = options?.durableParsedFileStoragePath;
+  // CFG/PDG opt-in (#2081 M1) — carried in workerData alongside the store paths.
+  const pdg = options?.pdg === true;
+  const pdgMaxFunctionLines = options?.pdgMaxFunctionLines;
+  const workerStoreData =
+    parsedFileStoreStoragePath || durableParsedFileStoragePath || pdg
+      ? { parsedFileStoreStoragePath, durableParsedFileStoragePath, pdg, pdgMaxFunctionLines }
+      : undefined;
+  const workerHeapCapMb = resolveWorkerHeapCapMb(size);
+  // The 512MB per-worker floor exists so a worker can parse anything real,
+  // but on a very small container a large pool of floored workers can still
+  // overcommit total memory (#2649 review). Behavior is unchanged — deaths
+  // are attributed and quarantine converges — but say so up front, with the
+  // two levers, instead of letting the operator discover it from worker OOMs.
+  const poolCommitMb = workerHeapCapMb * size;
+  const effectiveMb = Math.floor(effectiveRamBytes() / (1024 * 1024));
+  if (poolCommitMb > 0.6 * effectiveMb) {
+    logger.warn(
+      { poolSize: size, workerHeapCapMb, effectiveMb },
+      `Worker pool may overcommit memory: ${size} workers × ${workerHeapCapMb}MB heap cap exceeds 60% of the ${effectiveMb}MB available to this process. Reduce GITNEXUS_WORKER_POOL_SIZE or set GITNEXUS_WORKER_HEAP_MB.`,
+    );
+  }
+  // #2649 stall probe: test seam wins; production uses the heartbeat tracker.
+  const stallTracker = options?.stallMsProbe
+    ? { read: options.stallMsProbe, stop: (): void => undefined }
+    : startHeartbeatStallTracker();
+  const spawnWorker =
+    options?.workerFactory ??
+    ((url: URL) =>
+      new Worker(url, {
+        // Piped (not inherited) stdio: stderr for crash capture (#1741),
+        // stdout because inherited stdout triggers silent startup crashes on
+        // some hosts (see forwardWorkerStdout).
+        stdout: true,
+        stderr: true,
+        workerData: workerStoreData,
+        // The CFG visitors build per-function control-flow graphs by RECURSIVE
+        // descent over the tree-sitter AST, so deeply-nested source overflows
+        // the worker thread's call stack. A worker's stack is governed by
+        // `resourceLimits.stackSizeMb` (Node default 4 MB) — the main process's
+        // `--stack-size` flag does NOT propagate to worker threads — so raise it
+        // here. This pushes the overflow threshold from ~1.5k to several-k
+        // nesting levels (far beyond any hand-written code); a deeper machine-
+        // generated nest is still caught per-function (buildFunctionCfg's R4
+        // try/catch) and only that function's PDG is skipped, never a crash.
+        resourceLimits: { stackSizeMb: 16, maxOldGenerationSizeMb: workerHeapCapMb },
+      }));
+  /** Spawn + wire stdio capture/forwarding in one step (used by all spawn sites). */
+  const spawnAndCapture = (url: URL): Worker => {
+    const worker = spawnWorker(url);
+    captureWorkerStderr(worker);
+    forwardWorkerStdout(worker);
+    return worker;
+  };
   const workers: (Worker | undefined)[] = new Array(size);
+  type RetiredWorkerRecord = {
+    worker: Worker;
+    workerIndex: number;
+    reason: string;
+    cleanup: () => void;
+    terminate: () => Promise<void>;
+    /**
+     * True once the worker has been observed at a JS-visible safe point
+     * (posted a message / messageerror, or died). Until then the worker may
+     * be inside an N-API call, and `worker.terminate()` would abort the
+     * whole process (`Napi::Error` → SIGABRT, #2432).
+     */
+    safeToTerminate: boolean;
+    /** Resolves when `safeToTerminate` flips (or the worker exits/errors). */
+    safePoint: Promise<void>;
+  };
+  const retiredWorkers = new Set<RetiredWorkerRecord>();
   const respawnCount: number[] = new Array(size).fill(0);
   const activeSlots: Set<number> = new Set();
   // Layer 3 (quarantine): tracked via the dedicated `quarantine.ts`
@@ -624,54 +1102,174 @@ export const createWorkerPool = (
   const slotGenerations: number[] = new Array(size).fill(0);
   let poolBroken = false;
   let poolFailure: Error | undefined;
+  // Set by `terminate()` (below). Also read by the self-healing startup loop so
+  // a terminate during startup aborts pending backoff/retries (#1741).
+  let terminated = false;
+
+  /** Resolves `true` when `promise` settles within `ms`, else `false`. The
+   *  timer is unref'd so an expiring drain never holds the process open. */
+  const settledWithin = (promise: Promise<void>, ms: number): Promise<boolean> => {
+    if (ms <= 0) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), ms);
+      timer.unref?.();
+      void promise.then(() => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
+  };
+
+  const terminateTrackedWorkers = async (
+    liveWorkers: readonly (Worker | undefined)[],
+  ): Promise<void> => {
+    const retired = Array.from(retiredWorkers);
+    await Promise.all([
+      ...liveWorkers.map((worker) => worker?.terminate().catch(() => undefined)),
+      ...retired.map(async (record) => {
+        // #2432: a retired worker that has not reached a JS-visible safe
+        // point may be inside an N-API call — terminating it aborts the
+        // WHOLE process (`Napi::Error` → std::terminate → SIGABRT). Drain:
+        // wait (bounded) for its safe point; on expiry leave it running —
+        // it is unref'd and its at-safe-point terminate listener stays
+        // armed — and log which file wedged it.
+        if (!record.safeToTerminate) {
+          const drained = await settledWithin(record.safePoint, poolOptions.shutdownDrainMs);
+          if (!drained) {
+            logger.warn(
+              {
+                workerIndex: record.workerIndex,
+                reason: record.reason,
+                drainMs: poolOptions.shutdownDrainMs,
+              },
+              `Worker ${record.workerIndex} is still inside native code after the ` +
+                `${poolOptions.shutdownDrainMs}ms shutdown drain; leaving it un-terminated ` +
+                `to avoid a native abort (#2432). It will be terminated at its next safe point.`,
+            );
+            return;
+          }
+        }
+        await record.terminate();
+      }),
+    ]);
+    // Undrained records stay tracked so a repeated shutdown call can retry
+    // their (now possibly safe) terminate; record.terminate() removes each
+    // drained record via its cleanup.
+  };
 
   for (let i = 0; i < size; i++) {
-    workers[i] = spawnWorker(workerUrl);
+    workers[i] = spawnAndCapture(workerUrl);
     activeSlots.add(i);
   }
 
-  // Symmetrize the readiness gate across initial and replacement spawn
-  // paths. `replaceWorker` already awaits `waitForWorkerReady` per
-  // replacement so an init-crashing worker is dropped before dispatch
-  // sees it. The initial-spawn loop above didn't — a worker whose
-  // top-of-script init crashes (failed tree-sitter native binding,
-  // missing dependency) would only be noticed at the first dispatch's
-  // 30s idle timeout, vs the 5s WORKER_READY_TIMEOUT_MS bound that
-  // replacements enjoy.
+  // ── Self-healing startup readiness (#1741) ────────────────────────────────
+  // Bring every initial slot to readiness with a BOUNDED, jittered retry loop
+  // instead of dropping it on the first crash. This symmetrizes the gate with
+  // the runtime `replaceWorker` path (which already respawns a crashed slot),
+  // and adds genuine self-healing at startup:
   //
-  // The promise below settles every initial slot in parallel and drops
-  // unready slots from `activeSlots` before any dispatch can fire.
-  // `dispatch` awaits it via `initialReadyGate` on first invocation.
-  // Wrapped in a single `Promise.allSettled` so a slow worker doesn't
-  // block ready workers from being usable — first dispatch waits for
-  // all slots' verdicts (good or bad).
-  const initialReadyGate: Promise<void> = Promise.allSettled(
-    workers.map(async (w, i) => {
-      if (!w) return;
+  //  - TRANSIENT crash (a one-off OS hiccup / fork throttle): the slot is
+  //    respawned after jittered backoff and retried, up to STARTUP_RESTART_BUDGET
+  //    — so a blip heals itself with no operator intervention.
+  //  - DETERMINISTIC crash-loop (every worker dies with the SAME signature
+  //    before any reaches ready — the #1741 missing-binding case): detected via
+  //    `crashSignature` and short-circuited immediately, so the pool gives up in
+  //    ~1s rather than burning every slot's budget.
+  //
+  // When the loop exhausts, the slot is dropped from `activeSlots`. If EVERY
+  // slot is dropped, the first dispatch throws WorkerPoolInitializationError
+  // carrying the captured crash cause + classification — never a silent hang.
+  // Correctness of the deterministic short-circuit rests on the STRUCTURAL
+  // signal (zero workers ever ready + budget exhausted), not on signature
+  // matching alone: a missed match only costs a few seconds of extra retrying.
+  // Deterministic crash-loop detection (#1741). A crash counts toward
+  // "deterministic" ONLY after its signature reproduces across a respawn on the
+  // same slot — so every slot is guaranteed at least one self-heal attempt and
+  // a simultaneous attempt-0 crash storm (e.g. transient `spawn EAGAIN` under
+  // fork pressure) cannot be misclassified as deterministic. We short-circuit
+  // once enough DISTINCT slots have each reproduced: ≥2 normally, or 1 for a
+  // size-1 pool. Until then the structural floor (every slot exhausts its
+  // budget) still bounds the worst case, so a missed match only costs retries.
+  const lastStartupSignature = new Map<number, string>();
+  const reproducedStartupSlots = new Set<number>();
+  const deterministicSlotThreshold = Math.min(DETERMINISTIC_STARTUP_FINGERPRINT_THRESHOLD, size);
+  let deterministicStartupDetected = false;
+  let anyWorkerReachedReady = false;
+  // Cancel functions for in-flight startup backoffs (see abortableSleep). The
+  // backoff timer is ref'd so a retry actually runs; terminate() invokes these
+  // to clear pending backoffs and resolve their sleeps so the slot loops wake,
+  // see `terminated`, and give up — instead of the process staying pinned for
+  // the backoff cap after terminate (#1741).
+  const pendingStartupTimers = new Set<() => void>();
+
+  const bringSlotReady = async (i: number): Promise<void> => {
+    for (let attempt = 0; ; attempt++) {
+      const worker = workers[i];
+      if (!worker) return; // terminated mid-startup
       try {
-        await waitForWorkerReady(w);
+        await waitForWorkerReady(worker, poolOptions.workerReadyTimeoutMs);
+        anyWorkerReachedReady = true;
+        return; // ready — slot stays in activeSlots
       } catch (err) {
-        initialReadinessFailures.push(err instanceof Error ? err.message : String(err));
-        logger.warn(
-          {
-            workerIndex: i,
-            err: err instanceof Error ? err.message : String(err),
-          },
-          `Worker ${i} did not report ready on initial spawn; dropping slot.`,
-        );
-        await w.terminate().catch(() => undefined);
+        const msg = err instanceof Error ? err.message : String(err);
+        const sig = crashSignature(msg);
+        // Same signature as this slot's previous attempt => it survived a
+        // respawn, so retrying this slot is futile. (First crash has no prior
+        // signature, so attempt 0 never counts — every slot self-heals once.)
+        if (lastStartupSignature.get(i) === sig) reproducedStartupSlots.add(i);
+        lastStartupSignature.set(i, sig);
+        if (!anyWorkerReachedReady && reproducedStartupSlots.size >= deterministicSlotThreshold) {
+          deterministicStartupDetected = true;
+        }
+        await worker.terminate().catch(() => undefined);
         workers[i] = undefined;
-        activeSlots.delete(i);
+
+        const giveUp =
+          terminated || deterministicStartupDetected || attempt >= STARTUP_RESTART_BUDGET;
+        if (giveUp) {
+          initialReadinessFailures.push(msg);
+          activeSlots.delete(i);
+          logger.warn(
+            { workerIndex: i, attempt, err: msg, deterministic: deterministicStartupDetected },
+            deterministicStartupDetected
+              ? `Worker ${i} hit a deterministic startup crash-loop; dropping slot without further retries.`
+              : `Worker ${i} did not report ready after ${attempt + 1} attempt(s); dropping slot.`,
+          );
+          return;
+        }
+        // Transient: jittered backoff, then respawn the slot and retry.
+        await abortableSleep(
+          startupBackoffMs(attempt),
+          () => terminated || deterministicStartupDetected,
+          pendingStartupTimers,
+        );
+        if (terminated || deterministicStartupDetected) {
+          initialReadinessFailures.push(msg);
+          activeSlots.delete(i);
+          return;
+        }
+        logger.warn(
+          { workerIndex: i, attempt: attempt + 1 },
+          `Worker ${i} crashed during startup; respawning slot (self-heal attempt ${attempt + 1}/${STARTUP_RESTART_BUDGET}).`,
+        );
+        workers[i] = spawnAndCapture(workerUrl);
       }
-    }),
+    }
+  };
+
+  // First dispatch awaits this; it settles every slot's bounded retry loop in
+  // parallel and drops the unrecoverable ones before any dispatch can fire.
+  const initialReadyGate: Promise<void> = Promise.allSettled(
+    workers.map((_, i) => bringSlotReady(i)),
   ).then(() => undefined);
 
   const dispatch = async <TInput, TResult>(
     items: TInput[],
     onProgress?: (filesProcessed: number) => void,
+    chunkHash?: string,
   ): Promise<TResult[]> => {
     // Await the initial-spawn readiness gate (F13). On first dispatch
-    // this blocks for up to WORKER_READY_TIMEOUT_MS while every initial
+    // this blocks for up to poolOptions.workerReadyTimeoutMs while every initial
     // worker's `{type:'ready'}` handshake is checked; on subsequent
     // dispatches the promise is already settled and resolves
     // synchronously. Slots whose initial worker crashed in top-of-
@@ -693,10 +1291,17 @@ export const createWorkerPool = (
         initialReadinessFailures.length > 0
           ? ` after initial ready handshake: ${initialReadinessFailures.join('; ')}`
           : '';
+      // The bounded self-heal exhausted (or short-circuited a deterministic
+      // crash-loop). Classify automatically so the caller renders the real
+      // cause without consulting any operator flag (#1741).
+      const crashClass: StartupCrashClass = deterministicStartupDetected
+        ? 'deterministic-startup'
+        : 'transient-exhausted';
       throw new WorkerPoolInitializationError(
         `Worker pool has no active workers${detail}`,
         [],
         initialReadinessFailures,
+        crashClass,
       );
     }
 
@@ -716,6 +1321,7 @@ export const createWorkerPool = (
       poolOptions.subBatchSize,
       poolOptions.subBatchMaxBytes,
       poolOptions.subBatchIdleTimeoutMs,
+      chunkHash,
     );
 
     return new Promise<TResult[]>((resolve, reject) => {
@@ -755,14 +1361,114 @@ export const createWorkerPool = (
         onProgress(next);
       };
 
-      const replaceWorker = async (workerIndex: number): Promise<boolean> => {
+      type WorkerRemovalMode = 'terminate' | 'retire';
+
+      const retireWorkerAfterTimeout = (
+        worker: Worker,
+        workerIndex: number,
+        reason: string,
+      ): void => {
+        let cleaned = false;
+        let terminateStarted = false;
+        let resolveSafePoint!: () => void;
+        const safePoint = new Promise<void>((resolve) => {
+          resolveSafePoint = resolve;
+        });
+
+        // A message/messageerror proves the worker is executing JS again; an
+        // exit/error means the thread is gone. Either way `worker.terminate()`
+        // can no longer land mid-N-API call (#2432), so shutdown's drain may
+        // stop waiting.
+        function markSafeToTerminate() {
+          record.safeToTerminate = true;
+          resolveSafePoint();
+        }
+
+        function cleanupRetired() {
+          if (cleaned) return;
+          cleaned = true;
+          worker.removeListener('message', onRetiredMessage);
+          worker.removeListener('error', onRetiredError);
+          worker.removeListener('exit', onRetiredExit);
+          worker.removeListener('messageerror', onRetiredMessageError);
+          retiredWorkers.delete(record);
+        }
+
+        async function terminateRetired() {
+          if (terminateStarted) return;
+          terminateStarted = true;
+          cleanupRetired();
+          await worker.terminate().catch(() => undefined);
+        }
+
+        function terminateWhenBackInJs() {
+          markSafeToTerminate();
+          void terminateRetired();
+        }
+
+        function onRetiredMessage(raw: unknown) {
+          if (raw === null || typeof raw !== 'object') return;
+          const type = (raw as { type?: unknown }).type;
+          if (type === 'sub-batch-done' || type === 'result' || type === 'error') {
+            terminateWhenBackInJs();
+          }
+        }
+
+        const onRetiredError = () => {
+          markSafeToTerminate();
+          cleanupRetired();
+        };
+        const onRetiredExit = () => {
+          markSafeToTerminate();
+          cleanupRetired();
+        };
+        const onRetiredMessageError = () => terminateWhenBackInJs();
+        const record: RetiredWorkerRecord = {
+          worker,
+          workerIndex,
+          reason,
+          cleanup: cleanupRetired,
+          terminate: terminateRetired,
+          safeToTerminate: false,
+          safePoint,
+        };
+        retiredWorkers.add(record);
+        worker.on('message', onRetiredMessage);
+        worker.once('error', onRetiredError);
+        worker.once('exit', onRetiredExit);
+        worker.once('messageerror', onRetiredMessageError);
+        (worker as Worker & { unref?: () => void }).unref?.();
+        logger.warn(
+          { workerIndex, reason },
+          `Worker ${workerIndex} timed out; retiring without immediate terminate to avoid aborting native parser state.`,
+        );
+      };
+
+      const removeWorkerFromSlot = async (
+        workerIndex: number,
+        mode: WorkerRemovalMode,
+        reason: string,
+      ): Promise<void> => {
         const existing = workers[workerIndex];
-        await existing?.terminate().catch(() => undefined);
         workers[workerIndex] = undefined;
+        if (!existing) return;
+        if (mode === 'retire') {
+          retireWorkerAfterTimeout(existing, workerIndex, reason);
+          return;
+        }
+        await existing.terminate().catch(() => undefined);
+      };
+
+      const replaceWorker = async (
+        workerIndex: number,
+        mode: WorkerRemovalMode = 'terminate',
+        reason = 'replacing worker',
+      ): Promise<boolean> => {
+        await removeWorkerFromSlot(workerIndex, mode, reason);
         if (stopped) return false;
-        const replacement = spawnWorker(workerUrl);
+        const replacement = spawnAndCapture(workerUrl);
         try {
-          await waitForWorkerReady(replacement);
+          await waitForWorkerReady(replacement, poolOptions.workerReadyTimeoutMs);
         } catch (err) {
           await replacement.terminate().catch(() => undefined);
           logger.warn(
@@ -802,8 +1508,23 @@ export const createWorkerPool = (
         reject(err);
         const liveWorkers = workers.slice();
         for (let i = 0; i < workers.length; i++) workers[i] = undefined;
+        // #2432: a live worker with a job in flight may be inside an N-API
+        // call — direct terminate risks the same native abort as the retired
+        // case. Route busy workers through the retire path (terminate at
+        // their next JS-visible safe point); idle workers are parked in the
+        // JS event loop and terminate safely right away.
+        const idleWorkers: (Worker | undefined)[] = [];
+        for (let i = 0; i < liveWorkers.length; i++) {
+          const worker = liveWorkers[i];
+          if (worker === undefined) continue;
+          if (busySlots.has(i)) {
+            retireWorkerAfterTimeout(worker, i, 'circuit breaker tripped with job in flight');
+          } else {
+            idleWorkers.push(worker);
+          }
+        }
         activeSlots.clear();
-        void Promise.all(liveWorkers.map((worker) => worker?.terminate().catch(() => undefined)));
+        void terminateTrackedWorkers(idleWorkers);
       };
 
       const maybeDone = () => {
@@ -880,6 +1601,7 @@ export const createWorkerPool = (
           estimatedBytes: filtered.reduce((sum, item) => sum + estimateItemBytes(item), 0),
           attempt: job.attempt,
           splitDepth: job.splitDepth,
+          chunkHash: job.chunkHash,
           timeoutMs: job.timeoutMs,
           cumulativeTimeoutMs: job.cumulativeTimeoutMs,
         });
@@ -893,6 +1615,7 @@ export const createWorkerPool = (
         workerIndex: number,
         reason: string,
         excludePaths: readonly string[],
+        removalMode: WorkerRemovalMode = 'terminate',
       ) => {
         if (stopped) return;
         consecutiveFailuresPerSlot[workerIndex]++;
@@ -921,9 +1644,7 @@ export const createWorkerPool = (
             },
             `Worker ${workerIndex} exceeded respawn budget; dropping slot.`,
           );
-          const dead = workers[workerIndex];
-          await dead?.terminate().catch(() => undefined);
-          workers[workerIndex] = undefined;
+          await removeWorkerFromSlot(workerIndex, removalMode, reason);
           activeSlots.delete(workerIndex);
           if (activeSlots.size === 0) {
             tripBreaker(
@@ -945,7 +1666,7 @@ export const createWorkerPool = (
           },
           `Worker ${workerIndex} died; respawning slot (attempt ${respawnCount[workerIndex]}/${poolOptions.maxRespawnsPerSlot}).`,
         );
-        const respawned = await replaceWorker(workerIndex);
+        const respawned = await replaceWorker(workerIndex, removalMode, reason);
         if (!respawned) {
           activeSlots.delete(workerIndex);
           if (activeSlots.size === 0) {
@@ -1017,6 +1738,7 @@ export const createWorkerPool = (
             estimatedBytes: firstItems.reduce((sum, item) => sum + estimateItemBytes(item), 0),
             attempt: job.attempt,
             splitDepth: job.splitDepth + 1,
+            chunkHash: job.chunkHash,
             timeoutMs: nextTimeout,
             cumulativeTimeoutMs: nextCumulative,
           };
@@ -1026,6 +1748,7 @@ export const createWorkerPool = (
             estimatedBytes: secondItems.reduce((sum, item) => sum + estimateItemBytes(item), 0),
             attempt: job.attempt,
             splitDepth: job.splitDepth + 1,
+            chunkHash: job.chunkHash,
             timeoutMs: nextTimeout,
             cumulativeTimeoutMs: nextCumulative,
           };
@@ -1193,10 +1916,28 @@ export const createWorkerPool = (
           maybeDone();
         };
 
+        let stallCreditUsed = false;
+        let stallAtArm = 0;
         const resetIdleTimer = () => {
           if (idleTimer) clearTimeout(idleTimer);
+          stallAtArm = stallTracker.read();
           idleTimer = setTimeout(() => {
             if (!settled) {
+              // #2649: when at least STALL_CREDIT_FRACTION of the timeout
+              // window was main-thread stall (GC pressure near the heap
+              // limit), the worker's progress messages were starved, not
+              // absent — credit the stall once per job and re-arm instead
+              // of splitting/retiring a healthy worker.
+              const stallMs = stallTracker.read() - stallAtArm;
+              if (!stallCreditUsed && stallMs >= job.timeoutMs * STALL_CREDIT_FRACTION) {
+                stallCreditUsed = true;
+                logger.warn(
+                  { workerIndex, stallMs: Math.round(stallMs), timeoutMs: job.timeoutMs },
+                  `Worker ${workerIndex} idle timeout overlapped a main-thread stall (GC pressure); re-arming once instead of retiring.`,
+                );
+                resetIdleTimer();
+                return;
+              }
               settled = true;
               cleanup();
               inFlightProgress[workerIndex] = 0;
@@ -1211,7 +1952,12 @@ export const createWorkerPool = (
                   activeWorkers--;
                   busySlots.delete(workerIndex);
                   requeueRemainder(job, decision.excludePaths);
-                  await handleWorkerDeath(workerIndex, decision.reason, decision.excludePaths);
+                  await handleWorkerDeath(
+                    workerIndex,
+                    decision.reason,
+                    decision.excludePaths,
+                    'retire',
+                  );
                   if (stopped) return;
                   if (activeSlots.has(workerIndex)) runWorker(workerIndex);
                   wakeIdleSlots();
@@ -1255,9 +2001,11 @@ export const createWorkerPool = (
                       },
                       `Worker ${workerIndex} hit consecutive-failure threshold on idle-timeout retry; tripping circuit breaker.`,
                     );
-                    const dead = workers[workerIndex];
-                    await dead?.terminate().catch(() => undefined);
-                    workers[workerIndex] = undefined;
+                    await removeWorkerFromSlot(
+                      workerIndex,
+                      'retire',
+                      'idle-timeout retry consecutive-failure threshold',
+                    );
                     activeSlots.delete(workerIndex);
                     tripBreaker(
                       new WorkerPoolDispatchError(
@@ -1278,12 +2026,18 @@ export const createWorkerPool = (
                       },
                       `Worker ${workerIndex} exceeded respawn budget during idle-timeout retry; dropping slot.`,
                     );
-                    const dead = workers[workerIndex];
-                    await dead?.terminate().catch(() => undefined);
-                    workers[workerIndex] = undefined;
+                    await removeWorkerFromSlot(
+                      workerIndex,
+                      'retire',
+                      'idle-timeout retry respawn budget exhausted',
+                    );
                     activeSlots.delete(workerIndex);
                   } else {
-                    const respawned = await replaceWorker(workerIndex);
+                    const respawned = await replaceWorker(
+                      workerIndex,
+                      'retire',
+                      'idle-timeout retry',
+                    );
                     if (!respawned) {
                       activeSlots.delete(workerIndex);
                     }
@@ -1323,14 +2077,19 @@ export const createWorkerPool = (
           if (slotGenerations[workerIndex] !== slotGen) return;
           if (settled || stopped) return;
           // Native postMessage delivers POJO directly via Node's
-          // structured clone. V8 deserialization failures (malformed
-          // frame, non-cloneable value) surface as a `messageerror`
-          // event handled below — they never reach this handler. The
-          // only thing we need to guard for here is a worker that
-          // sends a message without a `type` discriminant (a bug in
-          // the worker, not a wire-format issue): without the guard
-          // `null.type` would throw a TypeError out of the
-          // EventEmitter listener → uncaughtException on the main
+          // structured clone. Two distinct clone failure modes exist,
+          // and NEITHER reaches this handler: (1) a SENDER-side
+          // non-cloneable value (a function/symbol that leaked into the
+          // result) throws a synchronous `DataCloneError` on the
+          // worker's own postMessage — the parse worker self-sanitizes
+          // such results before delivery (#2112) and falls back to a
+          // primitive-only `{type:'error'}` if it still can't serialize;
+          // (2) a RECEIVER-side deserialization failure surfaces as a
+          // `messageerror` event handled below. The only thing THIS
+          // handler guards is a worker that sends a message without a
+          // `type` discriminant (a worker bug, not a wire-format issue):
+          // without the guard `null.type` would throw a TypeError out of
+          // the EventEmitter listener → uncaughtException on the main
           // thread.
           const msg = raw as WorkerOutgoingMessage;
           if (msg === null || typeof msg !== 'object' || typeof msg.type !== 'string') {
@@ -1358,12 +2117,15 @@ export const createWorkerPool = (
           } else if (msg.type === 'sub-batch-done') {
             waitingForFlush = true;
             resetIdleTimer();
-            worker.postMessage({ type: 'flush' });
+            // Carry the chunk hash on the flush so the worker can write a
+            // durable, content-addressed ParsedFile shard (warm-cache reuse)
+            // at the flush boundary where `accumulated.parsedFiles` is complete.
+            worker.postMessage({ type: 'flush', chunkHash: job.chunkHash });
           } else if (msg.type === 'error') {
             settled = true;
             cleanup();
             void recoverAndResume(
-              `Worker ${workerIndex} error: ${msg.error}`,
+              workerErrorReason(workerIndex, msg.error, msg.errorStack),
               resolveExcludePaths(),
             );
           } else if (msg.type === 'result') {
@@ -1408,10 +2170,27 @@ export const createWorkerPool = (
           if (!settled) {
             settled = true;
             cleanup();
-            void recoverAndResume(
-              `Worker ${workerIndex} error: ${err.message}`,
-              resolveExcludePaths(),
-            );
+            // The Node 'error' event fires on an UNCAUGHT worker throw (one that
+            // escaped the worker's own try/catch, or an async rejection). Unlike
+            // the `{type:'error'}` message, the event delivers a real Error whose
+            // `.stack` is the worker-side frame — carry it so the surfaced reason
+            // points at the actual failure site, not just `err.message` (#2068).
+            // A worker dying on ITS OWN heap cap (#2649) must be attributable to
+            // that cap, not read as generic quarantine noise — name the cap and
+            // its override so an oversized-but-legitimate file (e.g. under a
+            // raised GITNEXUS_MAX_FILE_SIZE) is a one-env-var fix.
+            // The 'error' event does not guarantee a well-formed Error: the
+            // structured-clone failure path can deliver a value with no
+            // `message` — guard every property access or the handler itself
+            // throws and the pool hangs instead of recovering.
+            const isWorkerHeapOom =
+              (err as NodeJS.ErrnoException | undefined)?.code === 'ERR_WORKER_OUT_OF_MEMORY' ||
+              (typeof err?.message === 'string' &&
+                err.message.includes('ERR_WORKER_OUT_OF_MEMORY'));
+            const reason = isWorkerHeapOom
+              ? `${workerErrorReason(workerIndex, err.message, err.stack)} (worker hit its ${workerHeapCapMb}MB heap cap — raise with GITNEXUS_WORKER_HEAP_MB)`
+              : workerErrorReason(workerIndex, err.message, err.stack);
+            void recoverAndResume(reason, resolveExcludePaths());
           }
         };
 
@@ -1430,12 +2209,15 @@ export const createWorkerPool = (
           }
         };
 
-        // `messageerror` fires when V8 fails to deserialize a postMessage
-        // payload (e.g., the worker tries to send a non-cloneable value
-        // back, or structured-clone hits an unsupported shape). The worker
-        // stays ALIVE but the message is lost — without this handler the
-        // pool would sit on the dropped message until the idle timeout
-        // expires. Treat it as worker death so the resilience layers fire:
+        // `messageerror` fires when V8 fails to DESERIALIZE a postMessage
+        // payload on THIS (receiver) side — a value that serialized on the
+        // worker but can't be reconstructed here. (A non-cloneable value on
+        // the SENDER side instead throws a synchronous DataCloneError on the
+        // worker's own postMessage; that path is caught and sanitized
+        // worker-side (#2112) and never arrives here.) The worker stays ALIVE
+        // but the message is lost — without this handler the pool would sit on
+        // the dropped message until the idle timeout expires. Treat it as
+        // worker death so the resilience layers fire:
         // requeue the remainder via `recoverAndResume`, attribute the
         // in-flight file from the `starting-file` signal (if observed),
         // and let the per-slot respawn budget and circuit breaker decide
@@ -1473,16 +2255,20 @@ export const createWorkerPool = (
     });
   };
 
-  let terminated = false;
   const terminate = async (): Promise<void> => {
     terminated = true;
+    stallTracker.stop();
+    // Cancel any in-flight startup backoff so its ref'd timer doesn't keep the
+    // event loop alive after terminate; each cancel resolves the awaiting sleep
+    // and the slot loop then sees `terminated` and gives up (#1741).
+    for (const cancel of [...pendingStartupTimers]) cancel();
     // `.catch(() => undefined)` per-worker matches every other terminate
     // site in this file. Without it, a hung/OOM-killed worker's terminate
     // rejection escapes `Promise.all` and replaces the original pipeline
     // exception when this is called from `runChunkedParseAndResolve`'s
     // finally block — masking the real failure and leaving `workers[]`
     // populated with dead references because the lines below never run.
-    await Promise.all(workers.map((w) => w?.terminate().catch(() => undefined)));
+    await terminateTrackedWorkers(workers);
     workers.length = 0;
     activeSlots.clear();
   };
@@ -1499,6 +2285,7 @@ export const createWorkerPool = (
       quarantined: quarantine.size,
       poolBroken,
       terminated,
+      pendingStartupTimers: pendingStartupTimers.size,
       slotGenerations: slotGenerations.slice(),
     }),
   };

@@ -1,14 +1,13 @@
 /**
  * Python: relative imports + class inheritance + ambiguous module disambiguation
  */
-import { describe, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'path';
 import fs from 'node:fs';
 import os from 'node:os';
 import {
   FIXTURES,
   CROSS_FILE_FIXTURES,
-  createResolverParityIt,
   getRelationships,
   getNodesByLabel,
   getNodesByLabelFull,
@@ -16,11 +15,6 @@ import {
   runPipelineFromRepo,
   type PipelineResult,
 } from './helpers.js';
-
-// Mirrors `csharp.test.ts`: skips tests in `LEGACY_RESOLVER_PARITY_EXPECTED_FAILURES.python`
-// when the legacy-resolver parity sweep runs (`REGISTRY_PRIMARY_PYTHON=0`). For the
-// default registry-primary CI run this is a transparent passthrough to vitest's `it`.
-const it = createResolverParityIt('python');
 
 function writeFixtureRepo(root: string, files: Record<string, string>): void {
   for (const [relPath, content] of Object.entries(files)) {
@@ -85,6 +79,50 @@ describe('Python relative import & heritage resolution', () => {
       const target = result.graph.getNode(edge.rel.targetId);
       expect(target).toBeDefined();
       expect(target!.label).not.toBe('Property');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Qualified / generic bases (#1951). An earlier synth DROPPED these shapes —
+// only bare `identifier` bases emitted, so production silently omitted their
+// inheritance edges. service.py exercises the three now-handled shapes plus a
+// bare control, each base defined in a sibling module:
+//   - Service: `base_mod.Model`   (attribute base, trailing id -> Model)
+//   - Nested:  `a.b.Base`         (nested attribute base, recurse -> Base)
+//   - Gen:     `Container[str]`   (subscript base, value: field -> Container)
+//   - Plain:   `Container`        (bare control, byte-identical capture)
+// Scope-resolution (the single path since #942) owns these edges; the synth's
+// bare-name text is asserted to match the documented per-shape reduction.
+// ---------------------------------------------------------------------------
+
+describe('Python qualified-base heritage resolution (#1951)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'python-qualified-base'), () => {});
+  }, 60000);
+
+  it('emits EXTENDS edges for attribute / nested-attribute / subscript / bare bases', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(edgeSet(extends_)).toEqual([
+      'Gen → Container',
+      'Nested → Base',
+      'Plain → Container',
+      'Service → Model',
+    ]);
+  });
+
+  it('emits no IMPLEMENTS edges (Python has no interfaces)', () => {
+    const implements_ = getRelationships(result, 'IMPLEMENTS');
+    expect(implements_.length).toBe(0);
+  });
+
+  it('all heritage edges point to real graph nodes', () => {
+    for (const edge of getRelationships(result, 'EXTENDS')) {
+      const target = result.graph.getNode(edge.rel.targetId);
+      expect(target).toBeDefined();
+      expect(target!.properties.name).toBe(edge.target);
     }
   });
 });
@@ -2127,7 +2165,7 @@ describe('Python cross-file binding propagation', () => {
 // Module import: `import models; models.User()` should produce CALLS edges
 // even when multiple imported modules export a class with the same name.
 // Python's `import models` is a namespace import — moduleAliasMap maps the
-// module alias to its source file, enabling resolveCallTarget to disambiguate
+// module alias to its source file, enabling scope-resolution to disambiguate
 // `models.User()` from `auth.User()` when both modules export `User`.
 // ---------------------------------------------------------------------------
 
@@ -2621,7 +2659,7 @@ describe('Python abstract dispatch', () => {
 });
 
 // ---------------------------------------------------------------------------
-// SM-9: lookupMethodByOwnerWithMRO — child.parent_method() via C3 parent walk
+// SM-9: inherited method resolution — child.parent_method() via C3 parent walk
 // ---------------------------------------------------------------------------
 
 describe('Python Child extends Parent — inherited method resolution (SM-9)', () => {
@@ -2960,9 +2998,7 @@ def create_utf8_user():
     user.save()
 `,
     });
-    result = await runPipelineFromRepo(repoDir, () => {}, {
-      workerThresholdsForTest: { minFiles: 1, minBytes: 0 },
-    });
+    result = await runPipelineFromRepo(repoDir, () => {}, {});
   }, 120000);
 
   afterAll(() => {
@@ -2982,5 +3018,56 @@ def create_utf8_user():
       expect(save).toBeDefined();
       expect(save!.targetFilePath).toBe('models.py');
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Inline constructor receiver: User(db).save() (#2708)
+// The receiver is a constructor expression rather than a binding, so the
+// compound-receiver resolver has to recognise that a free call naming a class
+// yields that class. Before #2708 the call was dropped entirely — the caller
+// was missing from impact(direction: 'upstream') while the two-step spelling
+// of the same call resolved.
+// ---------------------------------------------------------------------------
+
+describe('Python inline constructor receiver resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-inline-constructor-receiver'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves User(db).save() to User.save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const inlineSave = calls.find((c) => c.source === 'process_inline' && c.target === 'save');
+    expect(inlineSave).toMatchObject({
+      source: 'process_inline',
+      target: 'save',
+      targetFilePath: 'models/user.py',
+    });
+  });
+
+  it('keeps the two-step spelling resolving to Repo.save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const twostepSave = calls.find((c) => c.source === 'process_twostep' && c.target === 'save');
+    expect(twostepSave).toMatchObject({
+      source: 'process_twostep',
+      target: 'save',
+      targetFilePath: 'models/repo.py',
+    });
+  });
+
+  it('binds each caller to exactly one save() — no cross-class fan-out', () => {
+    const saveCalls = getRelationships(result, 'CALLS')
+      .filter((c) => c.target === 'save')
+      .map((c) => `${c.source}->${c.targetFilePath}`)
+      .sort();
+    expect(saveCalls).toEqual([
+      'process_inline->models/user.py',
+      'process_twostep->models/repo.py',
+    ]);
   });
 });

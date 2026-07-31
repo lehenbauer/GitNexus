@@ -37,7 +37,23 @@ export type ReferenceKind =
   | 'write'
   | 'type-reference'
   | 'inherits'
-  | 'import-use';
+  | 'import-use'
+  // An identifier in object-literal property-value position
+  // (`{ emitScopeCaptures: emitCppScopeCaptures }`, shorthand `{ hook }`).
+  // Resolution is owned entirely by the post-finalize property-dispatch pass
+  // (`emitPropertyDispatchCalls` via the callable-gated finalized-bindings
+  // walker `findCallableBindingInScope`; `resolveReferenceSites` skips these
+  // sites), so a non-function value never produces a reference. Emitted as a `USES`
+  // reference edge — NOT `CALLS` (a registration is not an invocation;
+  // Kythe `ref` / Joern `METHOD_REF` precedent). The invocation side is
+  // recovered separately by the property-dispatch pass, which uses
+  // `propertyKey` to synthesize CALLS at member-call sites (#2437).
+  | 'value-ref'
+  // A macro invocation (`log!(...)` / `vec![...]`). Resolved against
+  // `Macro`-labeled definitions ONLY (see `MacroRegistry`) so a macro
+  // never aliases a same-named free function — macros and functions are
+  // disjoint namespaces. Emitted as a `USES` edge, not `CALLS`.
+  | 'macro';
 
 /**
  * How a call site binds its target. Informs `Registry.lookup` Step 2
@@ -54,6 +70,18 @@ export type CallForm = 'free' | 'member' | 'constructor' | 'index';
 export interface ReferenceSite {
   /** The name being referenced (e.g., `'save'`, `'User'`, `'count'`). */
   readonly name: string;
+  /**
+   * Optional raw, qualified form of the referenced name when the source wrote
+   * a qualified path (e.g. a C++ base `struct D : Other::Inner` yields
+   * `'Other::Inner'`). `name` keeps the simple tail (`'Inner'`) for the existing
+   * scope-chain contract; resolution normalizes this via `normalizeQualifiedName`
+   * and resolves it against the full-path `QualifiedNameIndex` BEFORE the
+   * simple-tail walk, so a same-tail nested base resolves to the correct
+   * sibling instead of the first-inserted one (issue #1982). Populated only by
+   * per-language captures that emit `@reference.qualified-name`; absent
+   * otherwise, in which case resolution is unchanged.
+   */
+  readonly rawQualifiedName?: string;
   /** Source-text range of this reference. */
   readonly atRange: Range;
   /**
@@ -73,6 +101,14 @@ export interface ReferenceSite {
   /** Argument count at the call site; used by `provider.arityCompatibility`. */
   readonly arity?: number;
   /**
+   * Object-literal key under which a `value-ref` site registers its value
+   * (`{ emitScopeCaptures: emitHook }` → `'emitScopeCaptures'`; shorthand
+   * `{ emitHook }` → `'emitHook'`). Consumed by the property-dispatch pass
+   * to connect member-call sites (`x.emitScopeCaptures()`) to registered
+   * functions (#2437). Only set for `kind === 'value-ref'`.
+   */
+  readonly propertyKey?: string;
+  /**
    * Inferred argument types at the call site, one per argument. An
    * empty-string entry means "unknown" — consumers narrowing overload
    * candidates treat unknown as any-match. Populated by languages
@@ -87,4 +123,34 @@ export interface ReferenceSite {
    * for existing overload narrowing and conversion-rank logic.
    */
   readonly argumentTypeClasses?: readonly ParameterTypeClass[];
+  /**
+   * Compact encoding of a receiver that is itself an expression, so resolution
+   * can type it by folding over structure instead of re-parsing the receiver's
+   * source text.
+   *
+   * Format and the reason it is a string rather than `MixedChainStep[]` live in
+   * `receiver-chain-codec.ts` — briefly, the store's interning reviver re-shares
+   * objects only when they carry `nodeId` + `filePath`, which a chain step does
+   * not, so an object encoding would survive every warm load as fresh
+   * allocations.
+   *
+   * Absent whenever the receiver is a bare name, which is the overwhelming
+   * majority of sites — the field costs nothing where it is not needed.
+   */
+  readonly receiverChain?: string;
 }
+
+/**
+ * One step in a mixed receiver chain — the decoded form of a receiver that is
+ * itself an expression rather than a bare name.
+ *
+ * For `svc.getUser().address.save()`, the receiver of `save` decodes to
+ * `[{ kind: 'call', name: 'getUser' }, { kind: 'field', name: 'address' }]`
+ * over a base receiver of `svc`.
+ *
+ * Lives here rather than beside its producer because it is part of the
+ * ScopeExtractor output contract that this package owns: the producer
+ * (`extractMixedChain`) walks a tree-sitter AST and so must stay in the
+ * analyzer, but the shape it yields crosses into resolution.
+ */
+export type MixedChainStep = { kind: 'field' | 'call'; name: string };

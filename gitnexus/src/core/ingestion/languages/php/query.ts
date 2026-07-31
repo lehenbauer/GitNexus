@@ -54,6 +54,7 @@ const PHP_SCOPE_QUERY = `
 (interface_declaration) @scope.class
 (trait_declaration)     @scope.class
 (enum_declaration)      @scope.class
+(anonymous_class)       @scope.class
 
 (method_declaration)                        @scope.function
 (function_definition)                       @scope.function
@@ -74,6 +75,10 @@ const PHP_SCOPE_QUERY = `
 (enum_declaration
   name: (name) @declaration.name) @declaration.enum
 
+;; Enum case
+(enum_case
+  name: (name) @declaration.name) @declaration.const
+
 ;; ── Declarations — methods / functions / constructors ─────────────────────
 
 (method_declaration
@@ -81,6 +86,23 @@ const PHP_SCOPE_QUERY = `
 
 (function_definition
   name: (name) @declaration.name) @declaration.function
+
+;; Closure assigned to a variable: $handler = function () {...}; or fn() => ...;
+;; Anchor discipline (same contract as javascript/query.ts): @declaration.function
+;; sits on the INNER anonymous_function / arrow_function, NOT on the
+;; assignment_expression wrapper. That aligns anchor.range with the
+;; @scope.function range above, so pass2AttachDeclarations attaches the
+;; declaration to the CLOSURE's own scope rather than the enclosing function's.
+;; Without this the closure scope owns no callable def and
+;; pickCallerCallableDef falls through to the enclosing callable, making the
+;; closure a call TARGET but never a call SOURCE (#2699).
+(assignment_expression
+  left: (variable_name) @declaration.name
+  right: (anonymous_function) @declaration.function)
+
+(assignment_expression
+  left: (variable_name) @declaration.name
+  right: (arrow_function) @declaration.function)
 
 ;; ── Declarations — properties ─────────────────────────────────────────────
 
@@ -101,6 +123,20 @@ const PHP_SCOPE_QUERY = `
 (property_declaration
   (property_element
     name: (variable_name) @declaration.name)) @declaration.variable
+
+;; ── Declarations — closure bindings (#2693) ───────────────────────────────
+;; A dollar-name bound to a closure (fn(x) => x, or function(x){...}) IS a
+;; callable. PHP emitted the callable-flow seed and invoke for it already, but
+;; nothing DECLARED the name, so the flow pass had no SymbolDefinition to attach
+;; the seed to and the call stayed unresolved.
+;; Restricted to a closure value: declaring every PHP assignment would mint defs
+;; repo-wide for no resolution benefit.
+(assignment_expression
+  left: (variable_name (name) @declaration.name)
+  right: (arrow_function)) @declaration.variable
+(assignment_expression
+  left: (variable_name (name) @declaration.name)
+  right: (anonymous_function)) @declaration.variable
 
 ;; ── Imports — namespace_use_declaration ───────────────────────────────────
 ;;

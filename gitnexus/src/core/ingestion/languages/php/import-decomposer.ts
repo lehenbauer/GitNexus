@@ -22,9 +22,11 @@ import type { Capture, CaptureMatch } from 'gitnexus-shared';
 import { nodeToCapture, syntheticCapture, type SyntaxNode } from '../../utils/ast-helpers.js';
 
 export type PhpImportKind = 'namespace' | 'alias' | 'function' | 'const';
+type PhpImportedSymbolKind = 'type' | 'function' | 'const';
 
 interface PhpImportSpec {
   readonly kind: PhpImportKind;
+  readonly symbolKind: PhpImportedSymbolKind;
   /** Full backslash-separated path (backslashes intact): `Foo\Bar\Baz`. */
   readonly source: string;
   /** Local binding name — last source segment for plain imports, the
@@ -56,10 +58,22 @@ export function splitNamespaceUseDeclaration(stmtNode: SyntaxNode): CaptureMatch
     return decomposeGrouped(stmtNode, groupNode, qualifier);
   }
 
-  // Single use clause (possibly aliased).
-  const spec = parseSingleUseClause(stmtNode, qualifier);
-  if (spec === null) return [];
-  return [buildImportMatch(stmtNode, spec)];
+  // Non-grouped: iterate namespace_use_clause children (one per comma-separated
+  // import in `use A, B, C;`). The first import is also a namespace_use_clause
+  // in the grammar version used by the monorepo; namespace_name child handling
+  // was removed after confirming the clause wrapper covers all positions.
+  const out: CaptureMatch[] = [];
+
+  for (let i = 0; i < stmtNode.namedChildCount; i++) {
+    const child = stmtNode.namedChild(i);
+    if (child === null || child.type !== 'namespace_use_clause') continue;
+    const spec = parseUseClause(child, qualifier);
+    if (spec !== null) {
+      out.push(buildImportMatch(stmtNode, spec));
+    }
+  }
+
+  return out;
 }
 
 // ── Qualifier detection ────────────────────────────────────────────────────
@@ -81,29 +95,6 @@ function detectQualifier(node: SyntaxNode): PhpImportKind {
   return 'namespace';
 }
 
-// ── Single clause parsing ──────────────────────────────────────────────────
-
-function parseSingleUseClause(node: SyntaxNode, qualifier: PhpImportKind): PhpImportSpec | null {
-  // A plain `namespace_use_declaration` has one or more
-  // `namespace_use_clause` named children (each clause is one import,
-  // comma-separated for multiple).  For the single case there is one.
-  const clause = findNamedChild(node, 'namespace_use_clause');
-  if (clause !== null) return parseUseClause(clause, qualifier);
-
-  // Older grammar versions may put the qualified_name directly under
-  // the declaration node. Check for a qualified_name or name child.
-  const qualName = findNamedChild(node, 'qualified_name') ?? findNamedChild(node, 'name');
-  if (qualName === null) return null;
-  const source = qualName.text.trim();
-  if (source === '') return null;
-  return {
-    kind: qualifier,
-    source,
-    name: lastSegment(source),
-    atNode: node,
-  };
-}
-
 function parseUseClause(clause: SyntaxNode, qualifier: PhpImportKind): PhpImportSpec | null {
   // namespace_use_clause:
   //   qualified_name (or name)
@@ -116,23 +107,7 @@ function parseUseClause(clause: SyntaxNode, qualifier: PhpImportKind): PhpImport
   const source = qualName.text.trim();
   if (source === '') return null;
 
-  // Strategy 1: explicit alias_clause wrapper (older grammar versions).
-  const aliasClause = findNamedChild(clause, 'alias_clause');
-  if (aliasClause !== null) {
-    // alias_clause: "as" name
-    const aliasName = findNamedChild(aliasClause, 'name') ?? aliasClause.firstNamedChild;
-    const alias = aliasName?.text.trim() ?? '';
-    if (alias === '') return null;
-    return {
-      kind: 'alias',
-      source,
-      name: alias,
-      alias,
-      atNode: clause,
-    };
-  }
-
-  // Strategy 2: bare sibling `name` node after the qualified_name.
+  // Strategy: bare sibling `name` node after the qualified_name.
   // tree-sitter-php (≥ 0.22) emits `use Foo\Bar as Baz` as:
   //   namespace_use_clause
   //     qualified_name "Foo\Bar"
@@ -146,6 +121,7 @@ function parseUseClause(clause: SyntaxNode, qualifier: PhpImportKind): PhpImport
       if (alias !== '') {
         return {
           kind: 'alias',
+          symbolKind: symbolKindFor(qualifier),
           source,
           name: alias,
           alias,
@@ -157,6 +133,7 @@ function parseUseClause(clause: SyntaxNode, qualifier: PhpImportKind): PhpImport
 
   return {
     kind: qualifier,
+    symbolKind: symbolKindFor(qualifier),
     source,
     name: lastSegment(source),
     atNode: clause,
@@ -178,8 +155,10 @@ function decomposeGrouped(
   groupNode: SyntaxNode,
   outerQualifier: PhpImportKind,
 ): CaptureMatch[] {
-  // The prefix is the qualified_name that precedes the `{...}` group.
-  const prefixNode = findNamedChild(stmtNode, 'qualified_name') ?? findNamedChild(stmtNode, 'name');
+  // The prefix is the namespace_name that precedes the `{...}` group.
+  // tree-sitter-php emits the leading path as a namespace_name child,
+  // not qualified_name.
+  const prefixNode = findNamedChild(stmtNode, 'namespace_name') ?? findNamedChild(stmtNode, 'name');
   const prefix = prefixNode?.text.trim() ?? '';
 
   const out: CaptureMatch[] = [];
@@ -231,22 +210,7 @@ function parseInnerClause(
 
   const source = prefix !== '' ? `${prefix}\\${innerPath}` : innerPath;
 
-  // Strategy 1: explicit alias_clause wrapper (older grammar versions).
-  const aliasClause = findNamedChild(clause, 'alias_clause');
-  if (aliasClause !== null) {
-    const aliasName = findNamedChild(aliasClause, 'name') ?? aliasClause.firstNamedChild;
-    const alias = aliasName?.text.trim() ?? '';
-    if (alias === '') return null;
-    return {
-      kind: 'alias',
-      source,
-      name: alias,
-      alias,
-      atNode: clause,
-    };
-  }
-
-  // Strategy 2: bare sibling `name` node after the qualified_name (tree-sitter-php ≥ 0.22).
+  // Strategy: bare sibling `name` node after the qualified_name (tree-sitter-php ≥ 0.22).
   if (clause.namedChildCount >= 2) {
     const lastChild = clause.namedChild(clause.namedChildCount - 1);
     if (lastChild !== null && lastChild !== qualName && lastChild.type === 'name') {
@@ -254,6 +218,7 @@ function parseInnerClause(
       if (alias !== '') {
         return {
           kind: 'alias',
+          symbolKind: symbolKindFor(qualifier),
           source,
           name: alias,
           alias,
@@ -265,6 +230,7 @@ function parseInnerClause(
 
   return {
     kind: qualifier,
+    symbolKind: symbolKindFor(qualifier),
     source,
     name: lastSegment(innerPath),
     atNode: clause,
@@ -277,6 +243,7 @@ function buildImportMatch(stmtNode: SyntaxNode, spec: PhpImportSpec): CaptureMat
   const m: Record<string, Capture> = {
     '@import.statement': nodeToCapture('@import.statement', stmtNode),
     '@import.kind': syntheticCapture('@import.kind', spec.atNode, spec.kind),
+    '@import.symbol-kind': syntheticCapture('@import.symbol-kind', spec.atNode, spec.symbolKind),
     '@import.source': syntheticCapture('@import.source', spec.atNode, spec.source),
     '@import.name': syntheticCapture('@import.name', spec.atNode, spec.name),
   };
@@ -292,6 +259,12 @@ function buildImportMatch(stmtNode: SyntaxNode, spec: PhpImportSpec): CaptureMat
 function lastSegment(path: string): string {
   const parts = path.split('\\').filter(Boolean);
   return parts[parts.length - 1] ?? path;
+}
+
+function symbolKindFor(kind: PhpImportKind): PhpImportedSymbolKind {
+  if (kind === 'function') return 'function';
+  if (kind === 'const') return 'const';
+  return 'type';
 }
 
 /** Find the first named child with a given node type. */
