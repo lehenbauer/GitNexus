@@ -117,6 +117,9 @@ gitnexus/vendor/**/node_modules/
 
 local_docs/
 
+# Local reports and scratch files
+/untracked/
+
 # Local agent scratch / review prompts (never commit)
 # (.agents/plugins/marketplace.json is the checked-in Codex plugin
 # marketplace registry — the rest of .agents/ stays local scratch.)
