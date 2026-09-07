@@ -120,6 +120,117 @@ describe('intended standard-skill improvements stay in every applicable copy', (
     }
   });
 
+  it('documents the AsyncAPI analyze flag in every CLI copy', () => {
+    for (const file of standardSkillCopies('gitnexus-cli')) {
+      expect(fs.readFileSync(file, 'utf-8')).toContain('`--asyncapi-spec <path>`');
+    }
+  });
+
+  // These copies are NOT byte-compared (only the engineering FAMILY above is),
+  // so a runner added to resolve-analyze-cmd.cjs can silently miss them. The
+  // audience that most needs bunx documented — a bun-only machine with no npm,
+  // npx or pnpm — is exactly the one an npx/pnpm-only bootstrap line strands.
+  it('documents the bunx runner and bootstrap in every CLI copy', () => {
+    for (const file of standardSkillCopies('gitnexus-cli')) {
+      const content = fs.readFileSync(file, 'utf-8');
+      expect(content).toContain('else `bunx`');
+      expect(content).toContain('bunx gitnexus@latest analyze');
+    }
+  });
+
+  it('documents CLI fallbacks in every impact-analysis copy', () => {
+    const required = [
+      'node .gitnexus/run.cjs impact <symbol> --direction upstream --repo .',
+      'node .gitnexus/run.cjs detect-changes --scope all --repo .',
+      'replace `node .gitnexus/run.cjs` with `npx gitnexus`',
+      'detect_changes({scope: "all"})',
+    ];
+    for (const file of standardSkillCopies('gitnexus-impact-analysis')) {
+      const content = fs.readFileSync(file, 'utf-8');
+      for (const fragment of required) expect(content).toContain(fragment);
+    }
+  });
+
+  // The risk scale's own escape hatch. `UNKNOWN` means the walk could not
+  // answer, and an agent that reads it as a low rung proceeds on a zero — the
+  // one reading the verdict exists to prevent.
+  //
+  // This assertion exists because its absence let real drift ship: the canonical
+  // `.claude/` copy lost the UNKNOWN block while the plugin mirror kept it, and
+  // this suite passed 54/54 with the two copies contradicting each other. The
+  // byte-identical check above covers only the plan/work/review/lfg family, and
+  // the fragment lists are the only guard the standard skills get — so a fragment
+  // that is not listed is a fragment nothing protects.
+  it('keeps the UNKNOWN-risk guidance in every impact-analysis copy', () => {
+    const required = [
+      '| **Zero callers found**         | **UNKNOWN** |',
+      '`UNKNOWN` is not a low rung on this scale',
+      'Confirm with a text search before',
+    ];
+    const copies = standardSkillCopies('gitnexus-impact-analysis');
+    // Guard the guard: an empty copy list would make every loop below vacuous.
+    expect(copies.length).toBeGreaterThan(1);
+    for (const file of copies) {
+      const content = fs.readFileSync(file, 'utf-8');
+      for (const fragment of required) expect(content).toContain(fragment);
+    }
+  });
+
+  it('keeps the cross-surface risk-scale guidance in every impact-analysis copy', () => {
+    const required = [
+      '`riskSharedAxes`',
+      'MCP File walks',
+      'web Graph-RAG expands File targets',
+      'Within single-repo mode',
+      'Within group mode',
+      'overlays resolved',
+    ];
+    for (const file of standardSkillCopies('gitnexus-impact-analysis')) {
+      const content = fs.readFileSync(file, 'utf-8');
+      for (const fragment of required) expect(content).toContain(fragment);
+    }
+  });
+
+  // Same shape as the UNKNOWN guard above, for the other half of the verdict:
+  // `detect_changes` can come back SHORT — `partial` when a batched graph query
+  // failed, `truncated` when the changed-symbol listing hit its cap — and both
+  // read as a clean gate if the agent only looks at the count (#2915). The
+  // wording differs per copy (the Cursor mirror compresses it to one blockquote
+  // line), so the fragments here are the parts every copy shares.
+  it('keeps the partial/truncated degradation guidance in every impact-analysis copy', () => {
+    const required = [
+      '`partial: true` (a graph query failed) or `truncated: true` (the changed-symbol',
+      'listing was capped)',
+      'a zero there means unseen, not unaffected.',
+      'tick the pre-commit check.',
+    ];
+    const copies = standardSkillCopies('gitnexus-impact-analysis');
+    // Guard the guard: an empty copy list would make the loop below vacuous.
+    expect(copies.length).toBeGreaterThan(1);
+    for (const file of copies) {
+      const content = fs.readFileSync(file, 'utf-8');
+      for (const fragment of required) expect(content).toContain(fragment);
+    }
+  });
+
+  // The refactoring copies carry the same warning for the verification step a
+  // refactor ends on: there, a short list reads as "only the expected files
+  // changed" rather than as a low risk score.
+  it('keeps the partial/truncated degradation guidance in every refactoring copy', () => {
+    const required = [
+      '`partial: true` (a graph query failed) or `truncated: true` (the changed-symbol',
+      'listing was capped)',
+      'is not proof that only the expected files changed.',
+      'treat the refactor as verified.',
+    ];
+    const copies = standardSkillCopies('gitnexus-refactoring');
+    expect(copies.length).toBeGreaterThan(1);
+    for (const file of copies) {
+      const content = fs.readFileSync(file, 'utf-8');
+      for (const fragment of required) expect(content).toContain(fragment);
+    }
+  });
+
   it('documents the current tools, schema, and cross-repo trace in every guide copy', () => {
     const required = [
       '`route_map`',
@@ -138,12 +249,134 @@ describe('intended standard-skill improvements stay in every applicable copy', (
     }
   });
 
+  // #2899: the "Inline staleness signal" section was deleted from the
+  // canonical `.claude/` copy by an unrelated commit while the plugin mirror
+  // kept it — the same silent-deletion shape as the UNKNOWN-risk guard above,
+  // just for a hand-authored section instead of the machine-managed block.
+  // Scoped to canonical + plugin only: at the time of writing the npm mirror
+  // (gitnexus/skills/gitnexus-guide.md) already lacks this section as
+  // pre-existing, unrelated drift, so folding it into the loop above would
+  // fail on that unrelated copy instead of guarding this regression.
+  it('keeps the inline-staleness-signal section in the canonical and plugin guide copies', () => {
+    for (const file of [
+      path.join(REPO_ROOT, '.claude', 'skills', 'gitnexus-guide', 'SKILL.md'),
+      path.join(REPO_ROOT, 'gitnexus-claude-plugin', 'skills', 'gitnexus-guide', 'SKILL.md'),
+    ]) {
+      const content = fs.readFileSync(file, 'utf-8');
+      expect(content).toContain('### Inline staleness signal');
+      expect(content).toContain('commitsBehind');
+    }
+  });
+
+  // Same reasoning as the UNKNOWN guard above: these copies are not
+  // byte-compared, so an edit to one copy alone silently ships four
+  // distributions that disagree about whether identity is required. The
+  // fragments are matched against whitespace-normalized text because the
+  // copies wrap the same sentences at different columns.
+  const IDENTITY_CONTRACT_SKILLS = [
+    'gitnexus-impact-analysis',
+    'gitnexus-refactoring',
+    'gitnexus-debugging',
+    'gitnexus-exploring',
+  ] as const;
+
+  const normalize = (text: string): string => text.replace(/\s+/g, ' ');
+
+  it.each(IDENTITY_CONTRACT_SKILLS)(
+    'keeps the repository-identity contract in every %s copy',
+    (name) => {
+      const required = [
+        'list_repos {}',
+        '`offset: pagination.nextOffset`',
+        '`hasMore` is false',
+
+        'an omitted `repo` normally errors',
+        'stop and ask',
+
+        'repo: "my-app"',
+
+        'bind repo; explicit repo when >1 indexed, ask if ambiguous',
+      ];
+      const copies = standardSkillCopies(name);
+      expect(copies.length).toBeGreaterThan(1);
+      for (const file of copies) {
+        const content = normalize(fs.readFileSync(file, 'utf-8'));
+        for (const fragment of required) expect(content).toContain(normalize(fragment));
+      }
+    },
+  );
+
   it("uses the rename API's text_search vocabulary in every refactoring copy", () => {
     for (const file of standardSkillCopies('gitnexus-refactoring')) {
       const content = fs.readFileSync(file, 'utf-8');
       expect(content).toContain('text_search');
       expect(content).not.toContain('ast_search');
     }
+  });
+});
+
+/**
+ * The body of the root AGENTS.md / CLAUDE.md machine-managed block
+ * (`<!-- gitnexus:start -->` … `<!-- gitnexus:end -->`), which
+ * generateGitNexusContent (src/cli/ai-context.ts) regenerates on every
+ * `gitnexus analyze`. Shared by the policy guards below.
+ */
+function extractManagedBlock(file: string): string {
+  const content = fs.readFileSync(path.join(REPO_ROOT, file), 'utf-8');
+  // Markers must occupy their own line — CLAUDE.md's "GitNexus rules"
+  // section links to AGENTS.md with an inline prose mention of both
+  // marker strings ("See the `<!-- gitnexus:start --> ... `" etc.) that a
+  // bare indexOf would mistake for the real block (mirrors
+  // findSectionMarkerIndex in ai-context.ts, #1041).
+  const match =
+    /(?:^|\n)<!-- gitnexus:start -->\r?\n([\s\S]*?)\n<!-- gitnexus:end -->(?:\r?\n|$)/.exec(
+      content,
+    );
+  expect(match, `${file} must contain an own-line gitnexus:start/end block`).not.toBeNull();
+  return match![1];
+}
+
+// The fork's managed blocks intentionally opt out of upstream's mandatory
+// graph workflows. Keep the committed blocks aligned with that policy, while
+// the shipped skill-copy checks below continue to enforce upstream parity.
+describe('root managed blocks keep graph workflows optional', () => {
+  it.each(['AGENTS.md', 'CLAUDE.md'])('%s has no mandatory graph gates', (file) => {
+    const block = extractManagedBlock(file);
+    expect(block).not.toMatch(/\b(?:MUST|NEVER|ALWAYS)\b/);
+    expect(block).not.toContain('## Always Do');
+    expect(block).not.toContain('## Never Do');
+  });
+
+  it('AGENTS.md explicitly skips local and cosmetic work', () => {
+    const block = extractManagedBlock('AGENTS.md');
+    expect(block).toContain('not a default step for every edit');
+    expect(block).toContain('HTML/CSS/markup');
+    expect(block).toContain('Prefer normal editor tools');
+    expect(block).toContain('Optional regression review');
+  });
+
+  it('CLAUDE.md imports the guidance without repeating it', () => {
+    const block = extractManagedBlock('CLAUDE.md');
+    expect(block).toContain('@AGENTS.md');
+    expect(block).not.toContain('detect_changes');
+    expect(block.length).toBeLessThan(350);
+  });
+
+  it('keeps limitations of graph results without forcing another query', () => {
+    const block = extractManagedBlock('AGENTS.md');
+    for (const fragment of [
+      'risk: UNKNOWN',
+      'partial: true',
+      'truncated: true',
+      'incomplete evidence',
+    ]) {
+      expect(block).toContain(fragment);
+    }
+    expect(block).not.toContain('re-run it');
+  });
+
+  it.each(['AGENTS.md', 'CLAUDE.md'])('%s omits volatile index counts', (file) => {
+    expect(extractManagedBlock(file)).not.toMatch(/\d+ (?:symbols|relationships|execution flows)/);
   });
 });
 

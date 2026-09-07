@@ -9,8 +9,9 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { type GeneratedSkillInfo } from './skill-gen.js';
+import { type GeneratedSkillInfo } from './generated-skill.js';
 import { STANDARD_SKILL_CATALOG } from './standard-skills.js';
+import { isEnoent } from './editor-targets.js';
 import { logger } from '../core/logger.js';
 
 // ESM equivalent of __dirname
@@ -42,6 +43,8 @@ export interface AIContextOptions {
    * "no PDG layer" note, so advertising it on a non-`--pdg` index is noise.
    */
   hasPdg?: boolean;
+  /** Whether this index includes opt-in Spring Actuator runtime evidence. */
+  hasSpringActuator?: boolean;
 }
 
 const GITNEXUS_START_MARKER = '<!-- gitnexus:start -->';
@@ -116,7 +119,8 @@ export interface GitNexusContentOptions {
   skipSkills?: boolean;
   /** Project-relative path to the runner `gitnexus analyze` drops next to the
    *  index (#1945). Referenced by docs so a single CLI-neutral command resolves
-   *  the available runner (global `gitnexus` → `pnpm dlx` → `npx`) at call time. */
+   *  the available runner (global `gitnexus` → `pnpm dlx` → `bunx` → `npx`) at
+   *  call time. */
   runnerPath?: string;
   /** Default branch for the regression-compare example (#243). Configurable so
    *  projects on `develop`/`master`/etc. don't get `base_ref: "main"` rewritten
@@ -130,6 +134,8 @@ export interface GitNexusContentOptions {
    *  line below — false (default) omits it, so a non-pdg index doesn't advertise
    *  a tool that only returns a "no PDG layer" note. */
   hasPdg?: boolean;
+  /** Whether Route nodes may carry Spring Actuator runtime evidence. */
+  hasSpringActuator?: boolean;
 }
 
 export function generateGitNexusContent(
@@ -140,18 +146,20 @@ export function generateGitNexusContent(
   const {
     generatedSkills,
     groupNames,
-    noStats,
+    noStats: _noStats,
     skipSkills,
     runnerPath = '.gitnexus/run.cjs',
     defaultBranch = 'main',
     hasPdg = false,
+    hasSpringActuator = false,
   } = opts;
   const generatedRows =
     generatedSkills && generatedSkills.length > 0
       ? generatedSkills
           .map(
             (s) =>
-              `| Work in the ${s.label} area (${s.symbolCount} symbols) | \`.claude/skills/${s.name}/SKILL.md\` |`,
+              // This fork omits volatile counts from generated guidance.
+              `| Work in the ${s.label} area | \`.claude/skills/${s.name}/SKILL.md\` |`,
           )
           .join('\n')
       : '';
@@ -179,10 +187,19 @@ ${tableBody}`
   // stay under the CLAUDE.md block token budget (#856); the cli skill carries the
   // full bootstrap + npm-11 fallback (`node.target is null` npx install crash).
   const runner = `node ${runnerPath}`;
+  // Bootstrap names every install-free one-shot rather than the one this machine
+  // resolves to: the block is committed, so a host-specific command would make
+  // two contributors on different package managers rewrite it at each other on
+  // every analyze (the per-machine churn of #1706). `bunx` is listed because a
+  // bun-only machine has no npm, npx or pnpm at all, and the npx-only note left
+  // it with a bootstrap command it could not run.
   const bootstrapNote =
-    `No \`${runnerPath}\` yet? \`npx gitnexus analyze\` ` +
-    '(npm 11 crash → `npm i -g gitnexus`; #1939).';
+    `No \`${runnerPath}\` yet? Bootstrap with \`npx\`, \`bunx\`, or \`pnpm dlx\` — ` +
+    'e.g. `bunx gitnexus@latest analyze` (npm 11 npx crash; #1939).';
 
+  // This block is injected into every user's repo and its total size is capped
+  // by test (ai-context.test.ts, #856) — a new bullet or clause has to be paid
+  // for by trimming an existing one.
   return `${GITNEXUS_START_MARKER}
 # GitNexus — Code Intelligence
 
@@ -195,15 +212,20 @@ This repo is indexed as **${projectName}**. Optional MCP tools over the call/imp
 
 **Skip for** local or non-graph work: known path or string, single-file edits, HTML/CSS/markup, copy, configs, fixtures, generated files, tests you already have open. Prefer normal editor tools there. One graph query that answers the question is enough — do not chain impact/context by habit.
 
-If a tool says the index is stale, run \`${runner} analyze\` from the project root. Otherwise ignore staleness. ${bootstrapNote}
+If a graph query you need reports a stale index, refresh with \`${runner} analyze --index-only\` from the project root. Otherwise ignore staleness. ${bootstrapNote}
 
 **Worktrees:** queries work from any checkout. To graph a linked worktree's branch, run \`npx gitnexus analyze --index-only --name ${projectName}-<branch>\` from the worktree root — its index lives in that worktree's own \`.gitnexus/\`, separate from this one. \`npx gitnexus remove <worktree-path> --force\` cleans it up when the branch work ends.
 
-**Optional regression review:** compare affected scope with \`detect_changes({scope: "compare", base_ref: ${JSON.stringify(markdownSafeBranch(defaultBranch))}})\` when a multi-file review needs it.${
+**Optional regression review:** compare affected scope with \`detect_changes({scope: "compare", base_ref: ${JSON.stringify(markdownSafeBranch(defaultBranch))}})\` when a multi-file review needs it. Treat \`risk: UNKNOWN\`, \`partial: true\`, or \`truncated: true\` as incomplete evidence; confirm relevant details in source.${
     hasPdg
       ? `\n\n**Optional PDG analysis:** \`pdg_query\` answers "under what condition does X run?" with \`mode: "controls"\` and can trace data flow with \`mode: "flows"\`; use \`line: <N>\`, \`affectedStatements\`, and \`byDepth\` when this index was built with \`--pdg\`.`
       : ''
   }
+${
+  hasSpringActuator
+    ? '\n\nSpring Actuator runtime evidence is enabled. A Route is authoritative only when `runtimeConfirmed === true`; `runtimeSource` is provenance and may also describe conflicts. Snapshot values are never persisted.'
+    : ''
+}
 
 ${
   groupNames && groupNames.length > 0
@@ -245,22 +267,47 @@ async function fileExists(filePath: string): Promise<boolean> {
 }
 
 /**
+ * Replace the block's volatile counts — the header parenthetical and the
+ * per-cluster symbol counts in the skills table — with fixed placeholders, so
+ * two renderings that differ only in those numbers compare equal.
+ *
+ * Placeholders rather than deletions: `--no-stats` REMOVES the parenthetical,
+ * which must still be written through. Deleting instead of substituting would
+ * make a with-counts block and a without-counts block compare equal, and the
+ * flag would silently stop taking effect on an already-injected file.
+ */
+function stripVolatileCounts(section: string): string {
+  return section
+    .replace(/ \(\d+ symbols, \d+ relationships, \d+ execution flows\)/g, ' (<counts>)')
+    .replace(/ \(\d+ symbols\)/g, ' (<count>)');
+}
+
+/**
  * Create or update GitNexus section in a file
  * - If file doesn't exist: create with GitNexus content
  * - If file exists without GitNexus section: append
- * - If file exists with GitNexus section: replace that section
+ * - If file exists with GitNexus section: replace that section, UNLESS the only
+ *   delta is the volatile counts (#2907). AGENTS.md and CLAUDE.md are the agent
+ *   guides teams commit, and the counts move with any code change, so a
+ *   count-only rewrite dirties a tracked file on every reindex for no reader
+ *   benefit. Live counts stay available from `gitnexus status` and
+ *   `gitnexus://repo/{name}/context`; the committed block keeps whichever
+ *   numbers it was last materially updated with.
  */
 async function upsertGitNexusSection(
   filePath: string,
   content: string,
   projectName: string,
-  stats: RepoStats,
-  noStats?: boolean,
+  _stats: RepoStats,
+  _noStats?: boolean,
 ): Promise<'created' | 'updated' | 'appended' | 'preserved'> {
   const exists = await fileExists(filePath);
 
   if (!exists) {
-    await fs.writeFile(filePath, content, 'utf-8');
+    // Same `.trim() + '\n'` shape the update paths write. Creating without the
+    // trailing newline made the NEXT analyze dirty a freshly committed file
+    // even at unchanged counts, purely to append it (#2907).
+    await fs.writeFile(filePath, content.trim() + '\n', 'utf-8');
     return 'created';
   }
 
@@ -302,12 +349,16 @@ async function upsertGitNexusSection(
       // cannot replace prose embedded mid-paragraph. Deliberately no `$`: text
       // after the line on the same line (e.g. ". MCP tools.") stays intact.
       // The parenthetical is optional so a count-free line left by a prior
-      // --no-stats run still matches — letting the name refresh, and letting
-      // counts return if --no-stats is later dropped.
+      // count-free block still matches when the project name changes.
       const statsPattern = /^(?:Indexed as|indexed by GitNexus as) \*\*[^*]+\*\*(?: \([^)]+\))?/m;
 
       if (statsPattern.test(existingSection)) {
         const updatedSection = existingSection.replace(statsPattern, statsLine);
+        // Count-only delta — leave the committed lean block alone (#2907). A
+        // project rename, or --no-stats dropping the parenthetical, still writes.
+        if (stripVolatileCounts(updatedSection) === stripVolatileCounts(existingSection)) {
+          return 'preserved';
+        }
         const before = existingContent.substring(0, startIdx);
         const after = existingContent.substring(endIdx + GITNEXUS_END_MARKER.length);
         await fs.writeFile(filePath, (before + updatedSection + after).trim() + '\n', 'utf-8');
@@ -316,6 +367,11 @@ async function upsertGitNexusSection(
       // Keep marker present but no stats line matched. Section is preserved
       // unchanged on disk; return a distinct status so callers/CLI output
       // don't mis-report this as 'updated' (which would imply a write).
+      return 'preserved';
+    }
+
+    // Preserve an unchanged block, including its surrounding user-owned text.
+    if (stripVolatileCounts(existingSection) === stripVolatileCounts(content)) {
       return 'preserved';
     }
 
@@ -348,17 +404,84 @@ export async function shouldMirrorSkillsToAgents(repoPath: string): Promise<bool
   }
 }
 
+const SKILL_PRESERVE_HINT =
+  'delete the file to refresh from the bundled template, or pass --skip-skills to skip skill install';
+
+async function readUtf8IfPresent(filePath: string): Promise<string | null> {
+  try {
+    return await fs.readFile(filePath, 'utf-8');
+  } catch (err) {
+    if (isEnoent(err)) return null;
+    throw err;
+  }
+}
+
+function skillBytesDiverge(existing: string | null, bundled: string): boolean {
+  return existing !== null && existing !== bundled;
+}
+
+/** Write bundled skill bytes unless an existing file already differs. */
+async function writeSkillUnlessDivergent(filePath: string, content: string): Promise<boolean> {
+  const existing = await readUtf8IfPresent(filePath);
+  if (skillBytesDiverge(existing, content)) {
+    logger.warn(`Preserved customized skill ${filePath}; ${SKILL_PRESERVE_HINT}.`);
+    return true;
+  }
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, content, 'utf-8');
+  return false;
+}
+
+async function inspectLegacySkillDir(
+  legacyDir: string,
+): Promise<{ nestedExisting: string | null; hasSiblings: boolean } | null> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(legacyDir);
+  } catch (err) {
+    if (isEnoent(err)) return null;
+    throw err;
+  }
+  const nestedExisting = entries.includes('SKILL.md')
+    ? await fs.readFile(path.join(legacyDir, 'SKILL.md'), 'utf-8')
+    : null;
+  return {
+    nestedExisting,
+    hasSiblings: entries.some((entry) => entry !== 'SKILL.md'),
+  };
+}
+
+function formatSkillInstallLine(
+  prefix: string,
+  total: number,
+  preserved: number,
+  allWrittenSuffix: string,
+  partialSuffix: string,
+): string {
+  if (preserved > 0) {
+    return `${prefix} (${total - preserved} written, ${preserved} ${partialSuffix})`;
+  }
+  return `${prefix} (${total} ${allWrittenSuffix})`;
+}
+
 /**
  * Install GitNexus skills as direct children of .claude/skills/
  * Works natively with Claude Code, Cursor, and GitHub Copilot.
  * Mirrored to .agents/skills/ when .agents/ exists.
  */
-async function installSkills(
-  repoPath: string,
-): Promise<{ skills: string[]; agentsMirror: boolean }> {
+async function installSkills(repoPath: string): Promise<{
+  skills: string[];
+  agentsMirror: boolean;
+  claudePreserved: number;
+  agentsPreserved: number;
+  legacyPreserved: number;
+}> {
   const skillsDir = path.join(repoPath, '.claude', 'skills');
   const legacySkillsDir = path.join(skillsDir, 'gitnexus');
   const installedSkills: string[] = [];
+  let claudePreserved = 0;
+  let agentsPreserved = 0;
+  let legacyPreserved = 0;
   const agentsMirror = await shouldMirrorSkillsToAgents(repoPath);
 
   for (const skill of STANDARD_SKILL_CATALOG.filter(
@@ -368,9 +491,6 @@ async function installSkills(
     const skillPath = path.join(skillDir, 'SKILL.md');
 
     try {
-      // Create skill directory
-      await fs.mkdir(skillDir, { recursive: true });
-
       // Try to read from package skills directory
       const packageSkillPath = path.join(__dirname, '..', '..', 'skills', `${skill.name}.md`);
       let skillContent: string;
@@ -392,14 +512,13 @@ Use GitNexus tools to accomplish this task.
 `;
       }
 
-      await fs.writeFile(skillPath, skillContent, 'utf-8');
+      if (await writeSkillUnlessDivergent(skillPath, skillContent)) claudePreserved += 1;
 
       // Mirror to .agents/skills/ for agents that read repo-local skills
       if (agentsMirror) {
         try {
-          const agentsSkillDir = path.join(repoPath, '.agents', 'skills', skill.name);
-          await fs.mkdir(agentsSkillDir, { recursive: true });
-          await fs.writeFile(path.join(agentsSkillDir, 'SKILL.md'), skillContent, 'utf-8');
+          const agentsSkillPath = path.join(repoPath, '.agents', 'skills', skill.name, 'SKILL.md');
+          if (await writeSkillUnlessDivergent(agentsSkillPath, skillContent)) agentsPreserved += 1;
         } catch (err) {
           logger.warn({ err }, `Warning: Could not mirror skill ${skill.name} to .agents/skills:`);
         }
@@ -411,7 +530,20 @@ Use GitNexus tools to accomplish this task.
       // deep. Remove only the child owned by this installer; unknown siblings
       // under the legacy grouping directory may be user-authored and survive.
       try {
-        await fs.rm(path.join(legacySkillsDir, skill.name), { recursive: true, force: true });
+        const legacyDir = path.join(legacySkillsDir, skill.name);
+        const nestedSkill = path.join(legacyDir, 'SKILL.md');
+        const leftover = await inspectLegacySkillDir(legacyDir);
+        if (leftover !== null && skillBytesDiverge(leftover.nestedExisting, skillContent)) {
+          logger.warn(`Preserved customized skill ${nestedSkill}; ${SKILL_PRESERVE_HINT}.`);
+          legacyPreserved += 1;
+        } else if (leftover?.hasSiblings) {
+          logger.warn(
+            `Preserved legacy skill directory ${legacyDir} because it contains operator-owned files.`,
+          );
+          legacyPreserved += 1;
+        } else if (leftover !== null) {
+          await fs.rm(legacyDir, { recursive: true, force: true });
+        }
       } catch (err) {
         logger.warn({ err }, `Warning: Could not remove legacy skill ${skill.name}:`);
       }
@@ -421,7 +553,13 @@ Use GitNexus tools to accomplish this task.
     }
   }
 
-  return { skills: installedSkills, agentsMirror };
+  return {
+    skills: installedSkills,
+    agentsMirror,
+    claudePreserved,
+    agentsPreserved,
+    legacyPreserved,
+  };
 }
 
 /**
@@ -467,6 +605,7 @@ export async function generateAIContextFiles(
     runnerPath,
     defaultBranch: options?.defaultBranch ?? 'main',
     hasPdg: options?.hasPdg ?? false,
+    hasSpringActuator: options?.hasSpringActuator ?? false,
   });
   const claudeContent = generateClaudeAgentsImportStub(projectName);
   const createdFiles: string[] = [];
@@ -500,12 +639,37 @@ export async function generateAIContextFiles(
 
   // Install standard skills directly under .claude/skills/ (unless --skip-skills)
   if (!options?.skipSkills) {
-    const { skills: installedSkills, agentsMirror } = await installSkills(repoPath);
+    const {
+      skills: installedSkills,
+      agentsMirror,
+      claudePreserved,
+      agentsPreserved,
+      legacyPreserved,
+    } = await installSkills(repoPath);
     if (installedSkills.length > 0) {
-      createdFiles.push(`.claude/skills/gitnexus-*/ (${installedSkills.length} skills)`);
+      createdFiles.push(
+        formatSkillInstallLine(
+          '.claude/skills/gitnexus-*/',
+          installedSkills.length,
+          claudePreserved,
+          'skills',
+          'preserved',
+        ),
+      );
       if (agentsMirror) {
         createdFiles.push(
-          `.agents/skills/gitnexus-*/ (${installedSkills.length} skills mirrored for .agents)`,
+          formatSkillInstallLine(
+            '.agents/skills/gitnexus-*/',
+            installedSkills.length,
+            agentsPreserved,
+            'skills mirrored for .agents',
+            'preserved for .agents',
+          ),
+        );
+      }
+      if (legacyPreserved > 0) {
+        createdFiles.push(
+          `.claude/skills/gitnexus/<name>/ (legacy directories preserved: ${legacyPreserved})`,
         );
       }
     }

@@ -109,7 +109,7 @@ mirror. `gitnexus/test/unit/shipped-skills-sync.test.ts` guards the copies. Toke
 ---
 
 <!-- gitnexus:start -->
-## GitNexus — Code Intelligence
+# GitNexus — Code Intelligence
 
 This repo is indexed as **GitNexus**. Optional MCP tools over the call/import graph — not a default step for every edit.
 
@@ -120,9 +120,12 @@ This repo is indexed as **GitNexus**. Optional MCP tools over the call/import gr
 
 **Skip for** local or non-graph work: known path or string, single-file edits, HTML/CSS/markup, copy, configs, fixtures, generated files, tests you already have open. Prefer normal editor tools there. One graph query that answers the question is enough — do not chain impact/context by habit.
 
-If a tool says the index is stale, run `npx gitnexus analyze`. Otherwise ignore staleness.
+If a graph query you need reports a stale index, refresh with `node .gitnexus/run.cjs analyze --index-only` from the project root. Otherwise ignore staleness. No `.gitnexus/run.cjs` yet? Bootstrap with `npx`, `bunx`, or `pnpm dlx` — e.g. `bunx gitnexus@latest analyze` (npm 11 npx crash; #1939).
 
 **Worktrees:** queries work from any checkout. To graph a linked worktree's branch, run `npx gitnexus analyze --index-only --name GitNexus-<branch>` from the worktree root — its index lives in that worktree's own `.gitnexus/`, separate from this one. `npx gitnexus remove <worktree-path> --force` cleans it up when the branch work ends.
+
+**Optional regression review:** compare affected scope with `detect_changes({scope: "compare", base_ref: "main"})` when a multi-file review needs it. Treat `risk: UNKNOWN`, `partial: true`, or `truncated: true` as incomplete evidence; confirm relevant details in source.
+
 
 <!-- gitnexus:end -->
 
@@ -164,6 +167,6 @@ npx gitnexus serve                         # HTTP API on port 4747 (from any ind
 
 ### Gotchas
 
-- `npm install` in `gitnexus/` triggers `prepare` (builds via `tsc`) and `postinstall` (materializes the vendored grammars into `node_modules/`, then prefers a committed prebuild per platform-arch and only source-builds when none matches). A C/C++ toolchain (`python3`, `make`, `g++`) is needed only for that source-build fallback.
-- The vendored grammars `tree-sitter-{c,dart,proto,swift,kotlin}` are handled uniformly: c is required; dart/proto/swift/kotlin are optional and skippable via `GITNEXUS_SKIP_OPTIONAL_GRAMMARS=1`. Install warnings appear only when no prebuild matches the platform-arch and no toolchain is present, and are non-fatal — only that language's parsing is unavailable.
+- `npm install` in `gitnexus/` triggers `prepare` (builds via `tsc`) and `postinstall` (`build-tree-sitter-grammars.cjs` activates committed prebuilds in place under `vendor/`, and only source-builds when none matches). A C/C++ toolchain (`python3`, `make`, `g++`) is needed only for that source-build fallback.
+- The vendored grammars `tree-sitter-{c,dart,proto,swift,kotlin,zig}` are handled uniformly: c is required; dart/proto/swift/kotlin/zig are optional and skippable via `GITNEXUS_SKIP_OPTIONAL_GRAMMARS=1`. Install warnings appear only when no prebuild matches the platform-arch and no toolchain is present, and are non-fatal — only that language's parsing is unavailable.
 - ESLint configured via `eslint.config.mjs` (TS, React Hooks, unused-imports). No `npm run lint` script; use `npx eslint .`. Prettier runs via lint-staged. CI checks both in `ci-quality.yml`.
